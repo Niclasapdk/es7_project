@@ -1,0 +1,8 @@
+artifacts/
+*.npz
+*.npy
+*.h5
+*.pt
+*.pth
+*.ckpt
+
