@@ -170,4 +170,3 @@ def welch_psd(x, fs, nperseg=4096, noverlap=None):
     scale = (win**2).sum()
     segs = []
     for start in range(0, n-nperseg+1, step):
-
