@@ -157,11 +157,11 @@ def _draw_sweep_params(cfg: GenCfg, rng: np.random.Generator) -> Tuple[float, fl
 def _make_example(cfg: GenCfg, rng: np.random.Generator):
     n = cfg.block_len
     clean = _bpsk_baseband(cfg.fs, cfg.symrate, n, rng)
-    x = clean.copy()
 
     # Optional CFO on the signal (before noise/jammer)
     if cfg.enable_cfo:
-        x = _apply_cfo(x, cfg.fs, cfg.max_cfo_hz, rng)
+        clean = _apply_cfo(clean, cfg.fs, cfg.max_cfo_hz, rng)
+    x = clean.copy()
 
     meta = {
         "snr_db": None, "jsr_db": None,
