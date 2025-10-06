@@ -1,260 +1,324 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Causal TCN denoiser for complex IQ (time domain), with streaming overlap-add inference.
-
-Expected NPZ formats (auto-detected):
-  1) 'X_train','Y_train','X_val','Y_val','X_test','Y_test'  (shape: [N, L, 2])
-  2) 'train_X','train_Y','val_X','val_Y','test_X','test_Y'
-  3) 'X','Y' (+ optional 'idx_train','idx_val','idx_test'); else it will 80/10/10 split
-
-If your L < window (W), the loader will pad; if L > W it will create rolling windows.
-"""
-
-import os, argparse, math, json
+# train_tcn.py
+import os, math, argparse, json, time, random
 from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 
 # ---------------------------
 # Utilities
 # ---------------------------
 
-def device_auto():
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def set_seed(seed: int = 1337):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-def to_tensor(x):  # np -> torch float32
-    return torch.from_numpy(x.astype(np.float32))
+def to_device(batch, device):
+    return tuple(t.to(device, non_blocking=True) for t in batch)
 
-def pairwise_diff(x, dim=-2):
-    # first difference along time (for ΔL1 loss); expects shape [B, T, C]
-    return x.diff(dim=dim)
+def numel(module: nn.Module) -> int:
+    return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+def human_time(s):
+    m, s = divmod(int(s), 60)
+    h, m = divmod(m, 60)
+    if h: return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 # ---------------------------
-# Data loading
+# Data
 # ---------------------------
 
-def load_npz_auto(path):
-    d = np.load(path, allow_pickle=True)
-    keys = set(d.keys())
-
-    # --- Your layout: Xtr, Ytr, Xva, Yva (plus optional 'meta')
-    if {"Xtr","Ytr","Xva","Yva"}.issubset(keys):
-        Xtr, Ytr = d["Xtr"], d["Ytr"]
-        Xva, Yva = d["Xva"], d["Yva"]
-        # No test set provided -> use val as test (or you can later add Xte/Yte)
-        Xte, Yte = Xva, Yva
-        print("[load_npz_auto] Using provided train/val. No test found -> reusing val as test.")
-        return (Xtr, Ytr), (Xva, Yva), (Xte, Yte)
-
-    # --- Other known layouts
-    patterns = [
-        ("X_train","Y_train","X_val","Y_val","X_test","Y_test"),
-        ("train_X","train_Y","val_X","val_Y","test_X","test_Y"),
-    ]
-    for pat in patterns:
-        if all(k in keys for k in pat):
-            Xtr, Ytr = d[pat[0]], d[pat[1]]
-            Xva, Yva = d[pat[2]], d[pat[3]]
-            Xte, Yte = d[pat[4]], d[pat[5]]
-            return (Xtr, Ytr), (Xva, Yva), (Xte, Yte)
-
-    if "X" in keys and "Y" in keys:
-        X, Y = d["X"], d["Y"]
-        n = len(X)
-        if {"idx_train","idx_val","idx_test"}.issubset(keys):
-            tr, va, te = d["idx_train"], d["idx_val"], d["idx_test"]
-            return (X[tr], Y[tr]), (X[va], Y[va]), (X[te], Y[te])
-        # fallback 80/10/10
-        n_tr = int(0.8 * n)
-        n_va = int(0.1 * n)
-        n_te = n - n_tr - n_va
-        return (X[:n_tr], Y[:n_tr]), (X[n_tr:n_tr+n_va], Y[n_tr:n_tr+n_va]), (X[n_tr+n_va:], Y[n_tr+n_va:])
-
-    raise ValueError(f"Unrecognized NPZ structure: keys={sorted(keys)}")
-
-def _to_N_L_2(A: np.ndarray, name: str):
+class IQWindows(Dataset):
     """
-    Normalize any IQ-ish array to shape [N, L, 2] (I,Q).
-    Accepted inputs:
-      - [N, L, 2]               (ok)
-      - [N, 2, L]               (transpose)
-      - [N, L] with complex     (split real/imag)
-      - [N, 2*L] with real      (assume interleaved IQ, reshape to [N, L, 2])
+    Dataset expecting sequences [N, T, 2]. If T>W, chunks with hop H.
+    If T<W:
+      - with drop_last=True, yields 0 windows (strict)
+      - with drop_last=False, yields ONE zero-padded window starting at 0
     """
-    if A.ndim == 3:
-        if A.shape[-1] == 2:
-            return A
-        if A.shape[1] == 2:
-            return np.transpose(A, (0, 2, 1))
-        raise ValueError(f"{name}: 3D but cannot infer IQ channel in {A.shape}")
+    def __init__(self, X: np.ndarray, Y: np.ndarray, W: int, H: int, drop_last=True):
+        assert X.ndim == 3 and Y.ndim == 3 and X.shape == Y.shape, "X/Y must be [N, T, 2]"
+        self.W = int(W); self.H = int(H)
+        self.drop_last = bool(drop_last)
 
-    if A.ndim == 2:
-        # complex case: split into I,Q
-        if np.iscomplexobj(A):
-            return np.stack([A.real, A.imag], axis=-1).astype(np.float32)
-        # interleaved real IQ along last axis?
-        N, W = A.shape
-        if W % 2 == 0:
-            L = W // 2
-            A2 = A.reshape(N, L, 2)
-            return A2
-        raise ValueError(f"{name}: 2D real array {A.shape} is not even-width; "
-                         f"can't infer interleaved IQ. Provide complex or [N,L,2].")
+        N, T, C = X.shape
+        assert C == 2, "last dim must be I/Q=2"
+        self.src = X.astype(np.float32, copy=False)
+        self.tgt = Y.astype(np.float32, copy=False)
 
-    raise ValueError(f"{name}: Expected 2D/3D array, got {A.shape}")
-
-def ensure_three_dim_xy(X, Y):
-    Xn = _to_N_L_2(X, "X")
-    Yn = _to_N_L_2(Y, "Y")
-    if Xn.shape != Yn.shape:
-        raise ValueError(f"X and Y shapes mismatch after normalization: {Xn.shape} vs {Yn.shape}")
-    return Xn, Yn
-
-
-class WindowSpec:
-    __slots__ = ("seq_idx","start","take","pad_left","pad_right")
-    def __init__(self, seq_idx, start, take, pad_left=0, pad_right=0):
-        self.seq_idx = seq_idx
-        self.start = start
-        self.take = take
-        self.pad_left = pad_left
-        self.pad_right = pad_right
-
-class WindowedIQDataset(Dataset):
-    """
-    Lazy windowing:
-      - Does NOT store padded arrays.
-      - Keeps only window specs and pads on-the-fly in __getitem__.
-    """
-    def __init__(self, X, Y, W=2048, H=512):
-        X, Y = ensure_three_dim_xy(X, Y)
-        assert X.shape == Y.shape and X.shape[-1] == 2
-        self.X = X
-        self.Y = Y
-        self.W = int(W)
-        self.H = int(H)
-        self.specs = []
-
-        for n in range(X.shape[0]):
-            L = X[n].shape[0]
-            if L < self.W:
-                pad = self.W - L
-                pre = pad // 2
-                post = pad - pre
-                # one centered window with padding
-                self.specs.append(WindowSpec(n, start=0, take=L, pad_left=pre, pad_right=post))
-            elif L == self.W:
-                self.specs.append(WindowSpec(n, start=0, take=L))
+        self.index = []
+        if T == W:
+            self.index = [(i, 0) for i in range(N)]
+        elif T > W:
+            for i in range(N):
+                starts = list(range(0, T - W + 1, self.H))
+                if not starts and not self.drop_last:
+                    starts = [0]
+                for s in starts:
+                    self.index.append((i, s))
+        else:  # T < W
+            if not self.drop_last:
+                # one padded window per sequence
+                self.index = [(i, 0) for i in range(N)]
             else:
-                # rolling windows that emit last H
-                start = 0
-                while start + self.W <= L:
-                    self.specs.append(WindowSpec(n, start=start, take=self.W))
-                    start += self.H
-                # tail coverage (right-aligned)
-                if start < L:
-                    self.specs.append(WindowSpec(n, start=L - self.W, take=self.W))
+                self.index = []  # strict: produce none
+
+        self.T = T
 
     def __len__(self):
-        return len(self.specs)
+        return len(self.index)
 
-    def __getitem__(self, i):
-        s = self.specs[i]
-        x = self.X[s.seq_idx]
-        y = self.Y[s.seq_idx]
-        if s.pad_left or s.pad_right:
-            # centered pad case
-            xw = np.pad(x[:s.take], ((s.pad_left, s.pad_right), (0,0)), mode="constant")
-            yw = np.pad(y[:s.take], ((s.pad_left, s.pad_right), (0,0)), mode="constant")
-        else:
-            xw = x[s.start:s.start + self.W]
-            yw = y[s.start:s.start + self.W]
-        return to_tensor(xw), to_tensor(yw)
+    def __getitem__(self, k):
+        i, s = self.index[k]
+        x = self.src[i, s:s+self.W, :]
+        y = self.tgt[i, s:s+self.W, :]
+        if x.shape[0] < self.W:
+            pad = self.W - x.shape[0]
+            x = np.pad(x, ((0, pad), (0, 0)), mode="constant")
+            y = np.pad(y, ((0, pad), (0, 0)), mode="constant")
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+def _find_npz_keys(npz):
+    """
+    Locate train/val/test arrays inside an .npz with flexible naming.
+    Returns dict: {"train": (Xtr, Ytr), "val": (Xva, Yva), "test": (Xte, Yte)}
+    Accepted patterns include:
+      - X_train/Y_train, X_val/Y_val, X_test/Y_test
+      - train_X/train_Y, val_X/val_Y, test_X/test_Y
+      - X_tr/Y_tr, X_va/Y_va, X_te/Y_te
+      - Xtr/Ytr, Xva/Yva, (optional Xte/Yte)
+    If no explicit test is present, val is split 50/50 into val/test.
+    """
+    keys = set(npz.files)
+
+    # Common complete triplets
+    triplets = [
+        ("X_train","Y_train","X_val","Y_val","X_test","Y_test"),
+        ("train_X","train_Y","val_X","val_Y","test_X","test_Y"),
+        ("X_tr","Y_tr","X_va","Y_va","X_te","Y_te"),
+        ("Xtr","Ytr","Xva","Yva","Xte","Yte"),
+    ]
+    for (xtr,ytr,xva,yva,xte,yte) in triplets:
+        if {xtr,ytr,xva,yva,xte,yte}.issubset(keys):
+            return {
+                "train": (npz[xtr], npz[ytr]),
+                "val":   (npz[xva], npz[yva]),
+                "test":  (npz[xte], npz[yte]),
+            }
+
+    # Handle the "no test set" variants explicitly
+    pairs_with_no_test = [
+        ("Xtr","Ytr","Xva","Yva"),
+        ("X_tr","Y_tr","X_va","Y_va"),
+        ("X_train","Y_train","X_val","Y_val"),
+        ("train_X","train_Y","val_X","val_Y"),
+    ]
+    for (xtr,ytr,xva,yva) in pairs_with_no_test:
+        if {xtr,ytr,xva,yva}.issubset(keys):
+            Xtr, Ytr = npz[xtr], npz[ytr]
+            Xva, Yva = npz[xva], npz[yva]
+            # If test exists with another naming, use it
+            for xte,yte in [("Xte","Yte"), ("X_te","Y_te"), ("X_test","Y_test"), ("test_X","test_Y")]:
+                if {xte,yte}.issubset(keys):
+                    return {
+                        "train": (Xtr, Ytr),
+                        "val":   (Xva, Yva),
+                        "test":  (npz[xte], npz[yte]),
+                    }
+            # Otherwise split val into val/test (50/50)
+            Nva = Xva.shape[0]
+            mid = max(1, Nva // 2)
+            return {
+                "train": (Xtr, Ytr),
+                "val":   (Xva[:mid], Yva[:mid]),
+                "test":  (Xva[mid:], Yva[mid:]),
+            }
+
+    # Fallback: try generic X/Y (we'll split 80/10/10)
+    if "X" in keys and "Y" in keys:
+        X = npz["X"]; Y = npz["Y"]
+        N = X.shape[0]
+        ntr = int(0.8 * N); nva = int(0.1 * N)
+        return {
+            "train": (X[:ntr], Y[:ntr]),
+            "val":   (X[ntr:ntr+nva], Y[ntr:ntr+nva]),
+            "test":  (X[ntr+nva:], Y[ntr+nva:]),
+        }
+
+    raise ValueError(f"Could not infer dataset keys from npz keys={sorted(keys)}")
+
+
+def _canonicalize_bt2(a: np.ndarray) -> np.ndarray:
+    """
+    Convert various IQ layouts to [N, T, 2] float32:
+      - complex: [N, T] complex64/128  -> stack real/imag -> [N, T, 2]
+      - channel-first: [N, 2, T]       -> transpose -> [N, T, 2]
+      - single sequence: [T, 2]        -> add batch -> [1, T, 2]
+      - real only: [N, T]              -> add zero Q -> [N, T, 2]
+    """
+    a = np.asarray(a)
+    # Complex → split to I/Q
+    if np.iscomplexobj(a):
+        a = np.stack([a.real, a.imag], axis=-1)
+
+    # Now ensure last dim is 2 (I/Q)
+    if a.ndim == 3 and a.shape[-1] == 2:
+        pass  # [N, T, 2] OK
+    elif a.ndim == 3 and a.shape[1] == 2 and a.shape[-1] != 2:
+        # [N, 2, T] → [N, T, 2]
+        a = np.transpose(a, (0, 2, 1))
+    elif a.ndim == 2 and a.shape[-1] == 2:
+        # [T, 2] → [1, T, 2]
+        a = a[None, ...]
+    elif a.ndim == 2:
+        # [N, T] real → add zero Q
+        a = np.stack([a, np.zeros_like(a)], axis=-1)
+    elif a.ndim == 1:
+        # [T] → [1, T, 2] with zero Q
+        a = a[None, :, None]
+        a = np.concatenate([a, np.zeros_like(a)], axis=-1)
+    else:
+        raise ValueError(f"Unsupported array shape {a.shape} for IQ data")
+
+    # Final sanity
+    if a.shape[-1] != 2:
+        raise ValueError(f"Expected last dim=2 after canonicalize, got {a.shape}")
+    return a.astype(np.float32, copy=False)
+
+
+def _align_xy_bt2(X: np.ndarray, Y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Make X and Y have the same [N, T, 2] by trimming to common N,T.
+    """
+    if X.ndim != 3 or Y.ndim != 3 or X.shape[-1] != 2 or Y.shape[-1] != 2:
+        raise ValueError(f"Expected [N,T,2], got X {X.shape}, Y {Y.shape}")
+    N = min(X.shape[0], Y.shape[0])
+    T = min(X.shape[1], Y.shape[1])
+    if X.shape[0] != Y.shape[0] or X.shape[1] != Y.shape[1]:
+        # Trim with a friendly note in stdout (optional)
+        print(f"[align] Trimming X {X.shape} / Y {Y.shape} to common (N={N}, T={T})")
+    return X[:N, :T, :], Y[:N, :T, :]
+
+
+def load_npz_dataset(path: Path, W: int, H: int, batch: int, workers: int = 4, drop_last=True):
+    npz = np.load(str(path))
+    parts = _find_npz_keys(npz)
+
+    def canon_pair(X, Y):
+        Xc = _canonicalize_bt2(X)
+        Yc = _canonicalize_bt2(Y)
+        Xc, Yc = _align_xy_bt2(Xc, Yc)
+        return Xc, Yc
+
+    Xtr, Ytr = canon_pair(parts["train"][0], parts["train"][1])
+    Xva, Yva = canon_pair(parts["val"][0],   parts["val"][1])
+    Xte, Yte = canon_pair(parts["test"][0],  parts["test"][1])
+
+    # Diagnostics
+    print(f"[data] shapes: train {Xtr.shape}, val {Xva.shape}, test {Xte.shape} | W={W} H={H}")
+
+    # Preferred: strict windows for training, tolerant for eval
+    ds_tr = IQWindows(Xtr, Ytr, W, H, drop_last=True)
+    ds_va = IQWindows(Xva, Yva, W, H, drop_last=False)
+    ds_te = IQWindows(Xte, Yte, W, H, drop_last=False)
+
+    # If strict train produced 0 windows (e.g., T<W), fall back to tolerant mode
+    if len(ds_tr) == 0:
+        print("[data] WARNING: train produced 0 windows with drop_last=True; retrying with drop_last=False (padded).")
+        ds_tr = IQWindows(Xtr, Ytr, W, H, drop_last=False)
+
+    # Final sanity check
+    print(f"[data] windows: train {len(ds_tr)}, val {len(ds_va)}, test {len(ds_te)}")
+
+    if len(ds_tr) == 0:
+        raise RuntimeError("Training dataset has 0 windows. Consider lowering --W or using --H<=W and ensure T>=1.")
+
+    dl_tr = DataLoader(ds_tr, batch_size=batch, shuffle=True,  num_workers=workers, pin_memory=True, drop_last=True)
+    dl_va = DataLoader(ds_va, batch_size=batch, shuffle=False, num_workers=workers, pin_memory=True, drop_last=False)
+    dl_te = DataLoader(ds_te, batch_size=batch, shuffle=False, num_workers=workers, pin_memory=True, drop_last=False)
+    return ds_tr, ds_va, ds_te, dl_tr, dl_va, dl_te
 
 # ---------------------------
-# Model: complex-aware causal TCN
+# Model: Causal TCN
 # ---------------------------
 
-class ComplexMix(nn.Module):
-    """
-    Per-channel learned complex 2x2 real mixing:
-       [[a, -b],
-        [b,  a]]  applied to [I,Q]
-    Implemented as a 1x1 conv over channels with constraints.
-    """
-    def __init__(self, channels=2):
-        super().__init__()
-        assert channels == 2
-        # parameters a,b as scalars or 1x1 conv weights
-        self.a = nn.Parameter(torch.tensor(1.0))
-        self.b = nn.Parameter(torch.tensor(0.0))
-
+class CausalConv1d(nn.Conv1d):
+    def __init__(self, in_ch, out_ch, kernel_size, dilation=1):
+        pad = (kernel_size - 1) * dilation  # left padding only (causal)
+        super().__init__(in_ch, out_ch, kernel_size, padding=pad, dilation=dilation)
     def forward(self, x):
-        # x: [B, T, 2]
-        a, b = self.a, self.b
-        I = x[..., 0]
-        Q = x[..., 1]
-        Io = a*I - b*Q
-        Qo = b*I + a*Q
-        return torch.stack([Io, Qo], dim=-1)
+        out = super().forward(x)
+        # Remove the extra right drift to keep causality/alignment
+        cut = (self.kernel_size[0] - 1) * self.dilation[0]
+        if cut > 0:
+            out = out[..., :-cut]
+        return out
 
-class CausalDepthwiseSepBlock(nn.Module):
-    def __init__(self, ch, kernel=5, dilation=1, dropout=0.0):
+class TCNBlock(nn.Module):
+    def __init__(self, ch, k, dilation, dropout=0.0):
         super().__init__()
-        pad = (kernel - 1) * dilation  # causal padding at left
-        self.pad = nn.ConstantPad1d((pad, 0), 0.0)  # pad on left only; operates on [B,C,T]
-        self.dw = nn.Conv1d(ch, ch, kernel_size=kernel, dilation=dilation,
-                            groups=ch, bias=True)
-        self.pw = nn.Conv1d(ch, ch, kernel_size=1, bias=True)
-        self.act = nn.SiLU()
-        self.norm = nn.GroupNorm(1, ch)
+        self.conv1 = CausalConv1d(ch, ch, k, dilation=dilation)
+        self.conv2 = CausalConv1d(ch, ch, k, dilation=dilation)
+        self.norm1 = nn.BatchNorm1d(ch)
+        self.norm2 = nn.BatchNorm1d(ch)
         self.dropout = nn.Dropout(dropout)
-        self.res = nn.Conv1d(ch, ch, kernel_size=1, bias=True)
-
-    def forward(self, x):  # x: [B,C,T]
-        h = self.pad(x)
-        h = self.dw(h)
-        h = self.pw(h)
-        h = self.norm(h)
-        h = self.act(h)
-        h = self.dropout(h)
-        return self.act(self.res(x) + h)
-
-class CausalTCN(nn.Module):
-    def __init__(self, width=128, blocks=10, kernel=5, dil_start=1, dil_max=None, dropout=0.0):
-        super().__init__()
-        self.mix = ComplexMix()
-
-        self.in1 = nn.Conv1d(2, width, kernel_size=1)
-        layers = []
-        dil = dil_start
-        for i in range(blocks):
-            layers.append(CausalDepthwiseSepBlock(width, kernel=kernel, dilation=dil, dropout=dropout))
-            dil = min(dil*2, dil_max if dil_max else dil*2)
-        self.tcn = nn.Sequential(*layers)
-        self.out = nn.Conv1d(width, 2, kernel_size=1)  # residual prediction
 
     def forward(self, x):
-        # x: [B,T,2] -> mix -> [B,2,T]
-        x_mix = self.mix(x)
-        h = x_mix.permute(0,2,1)
-        h = self.in1(h)
+        h = self.conv1(x)
+        h = self.norm1(h)
+        h = F.relu(h, inplace=True)
+        h = self.dropout(h)
+
+        h = self.conv2(h)
+        h = self.norm2(h)
+        h = F.relu(h, inplace=True)
+        h = self.dropout(h)
+
+        return x + h  # residual
+
+class TCN(nn.Module):
+    def __init__(self, in_ch=2, ch=128, out_ch=2, k=5, blocks=10, dropout=0.0):
+        super().__init__()
+        self.inp = nn.Conv1d(in_ch, ch, 1)
+        layers = []
+        for b in range(blocks):
+            d = 2 ** b
+            layers.append(TCNBlock(ch, k, dilation=d, dropout=dropout))
+        self.tcn = nn.Sequential(*layers)
+        self.out = nn.Conv1d(ch, out_ch, 1)
+
+    def forward(self, x_bt2):
+        # x: [B, W, 2] -> [B, 2, W]
+        x = x_bt2.transpose(1, 2)
+        h = self.inp(x)
         h = self.tcn(h)
-        r = self.out(h).permute(0,2,1)  # [B,T,2]
-        yhat = x + r  # residual connection to input
-        return yhat, r
+        y = self.out(h)
+        # -> [B, W, 2]
+        y_bt2 = y.transpose(1, 2)
+        return y_bt2, None
+
+def receptive_field(kernel: int, blocks: int) -> int:
+    # RF = 1 + (k-1) * sum_{i=0}^{B-1} 2^i = 1 + (k-1)*(2^B - 1)
+    return 1 + (kernel - 1) * (2 ** blocks - 1)
 
 # ---------------------------
-# Losses & Metrics
+# Losses & Metrics (stable)
 # ---------------------------
+
+def pairwise_diff(x):
+    # x: [B, T, C] -> differences along T (length T-1, pad back to T)
+    d = x[:, 1:, :] - x[:, :-1, :]
+    d = F.pad(d, (0, 0, 1, 0))
+    return d
 
 class TimeDomainLoss(nn.Module):
     """
     L = L1(ŷ_H, y_H) + alpha * L1(Δŷ_H, Δy_H)
-    where _H means last H samples (causal emission region).
     """
     def __init__(self, alpha=0.05):
         super().__init__()
@@ -262,257 +326,316 @@ class TimeDomainLoss(nn.Module):
         self.l1 = nn.L1Loss()
 
     def forward(self, yhat, y, H):
-        # yhat,y: [B, W, 2]; score last H along W
         if H <= 0 or H > y.shape[1]:
             H = y.shape[1]
         yhat_h = yhat[:, -H:, :]
         y_h = y[:, -H:, :]
         base = self.l1(yhat_h, y_h)
-        # small first-difference penalty (keeps high-freq crisp)
         d1 = pairwise_diff(yhat_h)
         d2 = pairwise_diff(y_h)
         delta = self.l1(d1, d2)
         return base + self.alpha * delta
 
-@torch.no_grad()
-def evm_stats(y_true, y_pred, eps=1e-12):
-    """
-    Returns: (EVM_percent, EVM_dB)
-      EVM_lin = sqrt( mean(|e|^2) / mean(|ref|^2) )
-      EVM%    = 100 * EVM_lin
-      EVM dB  = 20*log10(EVM_lin)
-    """
-    err = y_true - y_pred  # [B,T,2]
-    num = (err**2).sum(dim=-1).mean()
-    den = (y_true**2).sum(dim=-1).mean().clamp_min(eps)
-    evm_lin = torch.sqrt(num / den)
-    evm_pct = (100.0 * evm_lin).item()
-    evm_db  = (20.0 * torch.log10(evm_lin.clamp_min(eps))).item()
-    return evm_pct, evm_db
+# ---- Metric helpers (compat + stability) ----
+def snr_db(signal: torch.Tensor, noise: torch.Tensor, eps: float = 1e-12) -> float:
+    s = signal.float()
+    n = noise.float()
+    p_sig = s.pow(2).sum()
+    p_noi = n.pow(2).sum().clamp_min(eps)
+    return 10.0 * torch.log10((p_sig + eps) / p_noi)
 
 @torch.no_grad()
-def snr_db(signal, observed, eps=1e-12):
+def evm_stats(yhat: torch.Tensor, y: torch.Tensor,
+              ref_thresh: float = 1e-8, eps: float = 1e-12):
     """
-    SNR between a clean reference 'signal' and an observed version 'observed':
-      noise = observed - signal
-      SNR = 10*log10( P_signal / P_noise )
+    EVM using global sums + mask (batchwise power gate).
+    Returns: (evm_pct, evm_db, coverage in [0,1])
     """
-    noise = observed - signal
-    p_sig = (signal**2).sum(dim=-1).mean().clamp_min(eps)
-    p_nse = (noise**2).sum(dim=-1).mean().clamp_min(eps)
-    return (10.0 * torch.log10(p_sig / p_nse)).item()
+    yh = yhat.float(); yt = y.float()
+    B = yt.shape[0]
+    yh2 = yh.reshape(B, -1)
+    yt2 = yt.reshape(B, -1)
+    ref_pow_b = (yt2.pow(2)).sum(dim=1)  # [B]
+    mask = ref_pow_b > ref_thresh
+    if not mask.any():
+        return float("nan"), float("nan"), 0.0
+    num = ((yh2 - yt2).pow(2)).sum(dim=1)[mask].sum()
+    den = ref_pow_b[mask].sum().clamp_min(eps)
+    evm_lin = math.sqrt(float((num + eps) / (den + eps)))
+    evm_pct = 100.0 * evm_lin
+    evm_db  = 20.0 * math.log10(max(eps, evm_lin))
+    cov = float(mask.float().mean().item())
+    return evm_pct, evm_db, cov
 
-
-# ---------------------------
-# Training / Evaluation
-# ---------------------------
-
-def make_loaders(Xtr, Ytr, Xva, Yva, Xte, Yte, W, H, batch, num_workers=0):
-    ds_tr = WindowedIQDataset(Xtr, Ytr, W=W, H=H)
-    ds_va = WindowedIQDataset(Xva, Yva, W=W, H=H)
-    ds_te = WindowedIQDataset(Xte, Yte, W=W, H=H)
-    dl_tr = DataLoader(ds_tr, batch_size=batch, shuffle=True, drop_last=True, num_workers=num_workers)
-    dl_va = DataLoader(ds_va, batch_size=batch, shuffle=False, drop_last=False, num_workers=num_workers)
-    dl_te = DataLoader(ds_te, batch_size=batch, shuffle=False, drop_last=False, num_workers=num_workers)
-    return dl_tr, dl_va, dl_te
-
-def train_one_epoch(model, loss_fn, opt, dl, device, H, max_steps=0, accum_steps=1, scheduler=None, amp=False):
-    model.train()
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    run = {"loss": 0.0, "n": 0}
-    opt.zero_grad(set_to_none=True)
-    for step, (x, y) in enumerate(dl, 1):
-        x = x.to(device); y = y.to(device)
-        with torch.cuda.amp.autocast(enabled=amp):
-            yhat, _ = model(x)
-            loss = loss_fn(yhat, y, H) / accum_steps
-        scaler.scale(loss).backward()
-        if step % accum_steps == 0:
-            scaler.unscale_(opt)
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt); scaler.update()
-            opt.zero_grad(set_to_none=True)
-            if scheduler: scheduler.step()
-        bs = x.size(0)
-        run["loss"] += loss.item() * accum_steps * bs
-        run["n"] += bs
-        if step % 50 == 0:
-            cur_lr = next(iter(opt.param_groups))["lr"]
-            print(f"  step {step:05d} | batch_loss {(loss.item()*accum_steps):.6f} | lr {cur_lr:.2e}")
-        if max_steps and step >= max_steps:
+@torch.no_grad()
+def estimate_lag(yt: torch.Tensor, yh: torch.Tensor, search: int) -> int:
+    """
+    Estimate best alignment lag between yt (target) and yh (prediction).
+    Returns lag >= 0 meaning: yh shifted left by 'lag' aligns with yt.
+    We search lags in [0..search].
+    """
+    if search <= 0:
+        return 0
+    # Use first sample, I channel; normalize to zero-mean to avoid DC effects
+    a = yt[0, :, 0] - yt[0, :, 0].mean()
+    b = yh[0, :, 0] - yh[0, :, 0].mean()
+    # Brute-force small search (fast for H<=4096)
+    best_lag = 0
+    best_score = -1e9
+    T = a.numel()
+    for lag in range(0, search + 1):
+        t = T - lag
+        if t <= 8:
             break
-    return run["loss"]/max(1,run["n"])
-
-
+        s = (a[:t] * b[lag:lag+t]).sum().item()
+        if s > best_score:
+            best_score = s
+            best_lag = lag
+    return best_lag
 
 @torch.no_grad()
-def evaluate(model, loss_fn, dl, device, H):
+def evaluate(model, loss_fn, dl, device, H, ref_thresh=1e-8, eps=1e-12, align_search=None):
+    """
+    Stable evaluation with:
+      - global power sums (no mean of ratios)
+      - masking of near-zero reference batches
+      - small non-negative lag search to compensate causal delay
+    """
     model.eval()
-    acc = {"loss":0.0,"evm_pct":0.0,"evm_db":0.0,"snr_in":0.0,"snr_out":0.0,"n":0}
-    for x, y in dl:
-        x = x.to(device); y = y.to(device)
-        yhat, _ = model(x)
-        loss = loss_fn(yhat, y, H)
+    tot_loss = 0.0
+    n_loss = 0
+    err_pow = torch.zeros((), dtype=torch.float64, device=device)
+    ref_pow = torch.zeros((), dtype=torch.float64, device=device)
+    sig_pow = torch.zeros((), dtype=torch.float64, device=device)
+    nse_in_pow = torch.zeros((), dtype=torch.float64, device=device)
+    nse_out_pow = torch.zeros((), dtype=torch.float64, device=device)
+    kept_batches = 0
+    total_batches = 0
 
-        # emit region
+    for x, y in dl:
+        total_batches += 1
+        x, y = to_device((x, y), device)
+        with torch.cuda.amp.autocast(enabled=False):
+            yhat, _ = model(x)
+        loss = loss_fn(yhat, y, H)
+        bs = x.size(0)
+        tot_loss += loss.item() * bs
+        n_loss += bs
+
         Huse = min(H, y.shape[1])
         yt = y[:, -Huse:, :]
         yh = yhat[:, -Huse:, :]
         xx = x[:, -Huse:, :]
 
-        evm_pct, evm_dbv = evm_stats(yt, yh)
-        snr_in  = snr_db(yt, xx)   # jammed vs clean
-        snr_out = snr_db(yt, yh)   # denoised vs clean
+        # Estimate a small non-negative lag (best shift left for yh)
+        if align_search is not None and align_search > 0:
+            lag = estimate_lag(yt, yh, align_search)
+            if lag > 0:
+                yt = yt[:, :Huse-lag, :]
+                yh = yh[:, lag:, :]
+                xx = xx[:, :Huse-lag, :]
+                if yt.shape[1] < 16:
+                    continue  # too short after shift
 
-        bs = x.size(0)
-        acc["loss"]    += loss.item()*bs
-        acc["evm_pct"] += evm_pct*bs
-        acc["evm_db"]  += evm_dbv*bs
-        acc["snr_in"]  += snr_in*bs
-        acc["snr_out"] += snr_out*bs
-        acc["n"]       += bs
+        # Batch mask by reference power
+        ref_b = (yt.float().pow(2).sum(dim=(-1, -2))).mean()
+        if ref_b.item() <= ref_thresh:
+            continue
 
-    for k in ("loss","evm_pct","evm_db","snr_in","snr_out"):
-        acc[k] = acc[k]/max(1,acc["n"])
-    return acc
+        err_pow += (yh.float() - yt.float()).pow(2).sum(dtype=torch.float64)
+        ref_pow += (yt.float()).pow(2).sum(dtype=torch.float64)
+        sig_pow += (yt.float()).pow(2).sum(dtype=torch.float64)
+        nse_in_pow += (xx.float() - yt.float()).pow(2).sum(dtype=torch.float64)
+        nse_out_pow += (yh.float() - yt.float()).pow(2).sum(dtype=torch.float64)
+        kept_batches += 1
 
+    mean_loss = tot_loss / max(1, n_loss)
 
-# ---------------------------
-# Streaming overlap-add
-# ---------------------------
+    if ref_pow.item() <= eps or kept_batches == 0:
+        evm_pct = float("nan"); evm_db = float("nan")
+        snr_in = float("nan"); snr_out = float("nan")
+    else:
+        evm_lin = math.sqrt(float((err_pow + eps) / (ref_pow + eps)))
+        evm_pct = 100.0 * evm_lin
+        evm_db  = 20.0 * math.log10(max(eps, evm_lin))
+        snr_in  = 10.0 * math.log10(float((sig_pow + eps) / (nse_in_pow + eps)))
+        snr_out = 10.0 * math.log10(float((sig_pow + eps) / (nse_out_pow + eps)))
 
-@torch.no_grad()
-def stream_overlap_add(x_np, model, W=2048, H=512, device=None):
-    """
-    x_np: [L,2] numpy (jammed/noisy input)
-    returns: y_hat [L,2] numpy (denoised)
-    Causal: each window emits only last H; we OLA them back.
-    """
-    model.eval()
-    device = device or next(model.parameters()).device
-    x = x_np.astype(np.float32)
-    L = x.shape[0]
-    out = np.zeros_like(x, dtype=np.float32)
-    weight = np.zeros((L,1), dtype=np.float32)
-
-    # Hann-like synthesis window on emitted region to smooth overlap
-    win = np.hanning(2*H)[H:]  # length H, smooth rise
-    win = win.astype(np.float32)
-    start = 0
-    while start < L:
-        # take window (left-align if near end)
-        s = start - (W - H)
-        if s < 0: s = 0
-        e = min(s + W, L)
-        # pad if needed
-        xw = x[s:e]
-        if len(xw) < W:
-            pad = W - len(xw)
-            xw = np.pad(xw, ((W - len(xw), 0),(0,0)), mode='constant')  # left pad to keep causality
-        xt = torch.from_numpy(xw).unsqueeze(0).to(device)  # [1,W,2]
-        yhat, _ = model(xt)  # [1,W,2]
-        yhat = yhat[:, -H:, :].squeeze(0).cpu().numpy()  # [H,2]
-
-        # place emitted H back at [start : start+H]
-        end_emit = min(start+H, L)
-        span = end_emit - start
-        out[start:end_emit] += yhat[:span] * win[:span, None]
-        weight[start:end_emit, 0] += win[:span]
-        start += H
-
-    # avoid division by zero
-    weight[weight==0] = 1.0
-    return (out / weight).astype(np.float32)
+    return {
+        "loss": mean_loss,
+        "evm_pct": evm_pct,
+        "evm_db": evm_db,
+        "snr_in": snr_in,
+        "snr_out": snr_out,
+        "n": n_loss,
+        "ref_cov": 100.0 * kept_batches / max(1, total_batches),
+    }
 
 # ---------------------------
-# Main
+# Training
 # ---------------------------
+
+def make_optimizer(model, lr, wd):
+    return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+
+def make_scheduler(opt, sched, epochs, steps_per_epoch, warmup_epochs, base_lr):
+    total_steps = epochs * steps_per_epoch
+    warmup_steps = max(0, int(warmup_epochs * steps_per_epoch))
+
+    if sched == "cosine":
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return (step + 1) / max(1, warmup_steps)
+            t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.5 * (1.0 + math.cos(math.pi * t))
+        return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    elif sched == "none":
+        return torch.optim.lr_scheduler.LambdaLR(opt, lambda step: 1.0)
+    else:
+        raise ValueError(f"Unknown --sched {sched}")
+
+def train_one_epoch(model, loss_fn, dl, opt, scaler, device, H, accum_steps, max_steps=0):
+    model.train()
+    t0 = time.time()
+    running = 0.0
+    steps = 0
+    samples = 0
+    for it, (x, y) in enumerate(dl):
+        x, y = to_device((x, y), device)
+        with torch.cuda.amp.autocast(enabled=(scaler is not None)):
+            yhat, _ = model(x)
+            loss = loss_fn(yhat, y, H)
+            loss = loss / accum_steps
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        if (it + 1) % accum_steps == 0:
+            if scaler is not None:
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
+            opt.zero_grad(set_to_none=True)
+            steps += 1
+
+        running += loss.item() * x.size(0) * accum_steps
+        samples += x.size(0)
+
+        if max_steps and steps >= max_steps:
+            break
+
+    dt = human_time(time.time() - t0)
+    return running / max(1, samples), steps, dt
+
+# ---------------------------
+# CLI / Main
+# ---------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Causal TCN denoiser training")
+    p.add_argument("--data", type=str, required=True, help="Path to .npz dataset")
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--batch", type=int, default=256)
+    p.add_argument("--accum_steps", type=int, default=1)
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--W", type=int, default=2048, help="window length")
+    p.add_argument("--H", type=int, default=512,  help="hop/emit length")
+    p.add_argument("--width", type=int, default=192, help="TCN channels")
+    p.add_argument("--blocks", type=int, default=10, help="TCN residual blocks")
+    p.add_argument("--kernel", type=int, default=5, help="TCN kernel size")
+    p.add_argument("--lr", type=float, default=4e-3)
+    p.add_argument("--wd", type=float, default=5e-3)
+    p.add_argument("--sched", type=str, default="cosine", choices=["cosine","none"])
+    p.add_argument("--warmup_epochs", type=int, default=5)
+    p.add_argument("--max_steps", type=int, default=0, help="max optimizer steps per epoch (after grad accumulation)")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--out", type=str, default="tcn_denoiser.pt")
+    p.add_argument("--alpha", type=float, default=0.05, help="delta-L1 weight")
+    p.add_argument("--align_search", type=int, default=-1, help="override lag search window; default=-1 uses RF/8 capped to 256")
+    return p.parse_args()
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data", type=str, required=True, help="Path to dataset .npz")
-    p.add_argument("--epochs", type=int, default=60)
-    p.add_argument("--batch", type=int, default=128)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--width", type=int, default=128)
-    p.add_argument("--blocks", type=int, default=10)
-    p.add_argument("--kernel", type=int, default=5)
-    p.add_argument("--dropout", type=float, default=0.05)
-    p.add_argument("--W", type=int, default=2048, help="window length")
-    p.add_argument("--H", type=int, default=512, help="emitted/score hop")
-    p.add_argument("--alpha", type=float, default=0.05, help="ΔL1 loss weight")
-    p.add_argument("--save", type=str, default="tcn_denoiser.pt")
-    p.add_argument("--num_workers", type=int, default=0)
-    p.add_argument("--max_steps", type=int, default=200, help="Limit train steps per epoch (0=all)")
-    p.add_argument("--wd", type=float, default=1e-2, help="weight decay (AdamW)")
-    p.add_argument("--accum_steps", type=int, default=1, help="gradient accumulation steps")
-    p.add_argument("--sched", type=str, default="cosine", choices=["none","cosine"])
-    p.add_argument("--warmup_epochs", type=int, default=2)
-    p.add_argument("--amp", action="store_true", help="enable autocast (CUDA only)")
+    args = parse_args()
+    set_seed(args.seed)
 
-    args = p.parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device} | seed {args.seed}")
 
-    (Xtr, Ytr), (Xva, Yva), (Xte, Yte) = load_npz_auto(args.data)
-    dl_tr, dl_va, dl_te = make_loaders(Xtr, Ytr, Xva, Yva, Xte, Yte, args.W, args.H, args.batch, args.num_workers)
-    print(f"[dataset] train windows={len(dl_tr.dataset)} | val={len(dl_va.dataset)} | test={len(dl_te.dataset)}")
+    # Data
+    data_path = Path(args.data)
+    ds_tr, ds_va, ds_te, dl_tr, dl_va, dl_te = load_npz_dataset(
+        data_path, W=args.W, H=args.H, batch=args.batch, workers=args.workers, drop_last=True)
 
-        # --- Sanity probe: peek one batch ---
-    xb, yb = next(iter(dl_tr))
-    Hprobe = min(xb.shape[1], args.H)
-    x_h = xb[:, -Hprobe:, :]
-    y_h = yb[:, -Hprobe:, :]
-    def rms(a): return float(torch.sqrt((a**2).mean()))
-    print(f"[probe] H={Hprobe} | x_rms={rms(x_h):.6g} | y_rms={rms(y_h):.6g} | "
-        f"x_mean={float(x_h.mean()):.3e} | y_mean={float(y_h.mean()):.3e}")
-    print(f"[probe] shapes: xb={tuple(xb.shape)} (B,W,2)  yb={tuple(yb.shape)}")
+    # Model
+    model = TCN(in_ch=2, ch=args.width, out_ch=2, k=args.kernel, blocks=args.blocks, dropout=0.05).to(device)
+    nparams = numel(model)
+    print(f"Params: {nparams/1e6:.2f}M | W {args.W} H {args.H} | width {args.width} blocks {args.blocks} k {args.kernel}")
 
-    device = device_auto()
-    model = CausalTCN(width=args.width, blocks=args.blocks, kernel=args.kernel,
-                      dil_start=1, dil_max=512, dropout=args.dropout).to(device)
+    # Loss / Opt / Sched
     loss_fn = TimeDomainLoss(alpha=args.alpha)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    opt = make_optimizer(model, lr=args.lr, wd=args.wd)
 
-    def make_scheduler(opt, steps_per_epoch, epochs, warmup_epochs=0):
-        if args.sched == "none":
-            return None
-        total = steps_per_epoch * epochs
-        warm = steps_per_epoch * warmup_epochs
-        def lr_lambda(step):
-            if step < warm:
-                return max(1e-3, step / max(1, warm))  # linear warmup
-            t = (step - warm) / max(1, total - warm)
-            return 0.5 * (1 + math.cos(math.pi * t))   # cosine decay
-        return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    steps_per_epoch = max(1, len(dl_tr) // max(1, args.accum_steps))
+    scheduler = make_scheduler(opt, args.sched, args.epochs, steps_per_epoch, args.warmup_epochs, args.lr)
 
-    # after you build dl_tr:
-    steps_per_epoch = len(dl_tr) if args.max_steps == 0 else min(args.max_steps, len(dl_tr))
-    scheduler = make_scheduler(opt, steps_per_epoch, args.epochs, args.warmup_epochs)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
+    # Align search default: RF/8 limited to 256, non-negative (causal)
+    RF = receptive_field(args.kernel, args.blocks)
+    if args.align_search is None or args.align_search < 0:
+        align_search = min(256, max(0, RF // 8))
+    else:
+        align_search = max(0, args.align_search)
 
     best_val = float("inf")
-    print(f"Device: {device} | Params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    best_ckpt = args.out
 
-    for epoch in range(1, args.epochs+1):
-        tr_loss = train_one_epoch(model, loss_fn, opt, dl_tr, device, args.H, args.max_steps, args.accum_steps, scheduler, args.amp)
+    # Warmup print
+    print(f"Receptive field (samples): {RF} | align_search: {align_search} | steps/epoch: {steps_per_epoch}")
 
-        va = evaluate(model, loss_fn, dl_va, device, args.H)
-        dSNR = va["snr_out"] - va["snr_in"]
-        print(
-            f"Epoch {epoch:03d} | train {tr_loss:.6f} | val {va['loss']:.6f} | "
-            f"EVM% {va['evm_pct']:.2f} ({va['evm_db']:.2f} dB) | "
-            f"SNR_in {va['snr_in']:.2f} dB → SNR_out {va['snr_out']:.2f} dB | Δ {dSNR:+.2f} dB"
-        )
+    # Training loop
+    global_step = 0
+    t_train0 = time.time()
+    for ep in range(1, args.epochs + 1):
+        tr_loss, tr_steps, tr_dt = train_one_epoch(
+            model, loss_fn, dl_tr, opt, scaler, device, args.H, args.accum_steps, args.max_steps)
+        global_step += tr_steps
 
+        # Scheduler step per-epoch (cosine + warmup uses step count)
+        if isinstance(scheduler, torch.optim.lr_scheduler.LambdaLR):
+            scheduler.step()
 
+        # Eval
+        with torch.no_grad():
+            va = evaluate(model, loss_fn, dl_va, device, args.H, align_search=align_search)
+        lr_now = opt.param_groups[0]["lr"]
+        print(f"Epoch {ep:03d} | train {tr_loss:.6f} | val {va['loss']:.6f} "
+              f"| EVM% {va['evm_pct']:.2f} ({va['evm_db']:.2f} dB) "
+              f"| SNR_in {va['snr_in']:.2f} → SNR_out {va['snr_out']:.2f} "
+              f"| Δ { (va['snr_out'] - va['snr_in']) if (not math.isnan(va['snr_in']) and not math.isnan(va['snr_out'])) else float('nan'):+.2f} dB "
+              f"| cov {va['ref_cov']:.1f}% | lr {lr_now:.2e} | {tr_dt}")
+
+        # Save best by val loss
         if va["loss"] < best_val:
             best_val = va["loss"]
             torch.save({"model": model.state_dict(),
-                        "cfg": vars(args)}, args.save)
-            print(f"  ↳ saved -> {args.save}")
+                        "args": vars(args),
+                        "epoch": ep,
+                        "val": va}, best_ckpt)
+            print(f"  ↳ saved -> {best_ckpt}")
 
     # Final test
-    te = evaluate(model, loss_fn, dl_te, device, args.H)
-    print(f"Epoch {epoch:03d} | train {tr_loss:.6f} | val {va['loss']:.6f} | "f"EVM% {va['evm_pct']:.2f} ({va['evm_db']:.2f} dB) | "f"SNR_in {va['snr_in']:.2f} dB → SNR_out {va['snr_out']:.2f} dB | Δ {dSNR:+.2f} dB")
+    with torch.no_grad():
+        te = evaluate(model, loss_fn, dl_te, device, args.H, align_search=align_search)
+    print("\n=== TEST === "
+          f" loss {te['loss']:.6f} | EVM% {te['evm_pct']:.2f} ({te['evm_db']:.2f} dB) "
+          f"| SNR_in {te['snr_in']:.2f} → SNR_out {te['snr_out']:.2f} "
+          f"| Δ {(te['snr_out'] - te['snr_in']) if (not math.isnan(te['snr_in']) and not math.isnan(te['snr_out'])) else float('nan'):+.2f} dB "
+          f"| cov {te['ref_cov']:.1f}%")
 
 if __name__ == "__main__":
     main()
