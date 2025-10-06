@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: ubuntu:24.04
+From: tensorflow/tensorflow:latest-gpu 
 
 %environment
     export VIRTUAL_ENV=/opt/venv
@@ -9,9 +9,6 @@ From: ubuntu:24.04
     export PYTHONDONTWRITEBYTECODE=1
 
 %post
-# Set temporary directory
-    export TMPDIR=/tmp
-    mkdir -p $TMPDIR
     set -eux
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
@@ -25,7 +22,7 @@ From: ubuntu:24.04
     /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel
 
     # core pkgs
-    /opt/venv/bin/pip install --no-cache-dir numpy scipy matplotlib scikit-learn pandas tensor tensorflow[and-cuda] torch
+    /opt/venv/bin/pip install --no-cache-dir numpy scipy matplotlib scikit-learn pandas
 
 %test
     # Test that Python works
