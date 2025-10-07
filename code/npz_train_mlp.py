@@ -1,381 +1,318 @@
 #!/usr/bin/env python3
-"""
-npz_train_mlp.py — MLP IQ denoiser (CUDA-optimized, cluster-safe)
+# npz_train_mlp.py — wide MLP denoiser with residual target, GELU+LayerNorm, cosine LR + warmup
+# Extras: EMA weights, spectral warmup/auto-balance, MR spectral loss, grad clipping, EVM% & SNR metrics.
 
-Changes vs last version:
-- AMP updated to new API: torch.amp.autocast('cuda'), torch.amp.GradScaler('cuda')
-- torch.compile disabled by default; safe try/except fallback if enabled
-- All previous perf fixes kept (GPU spectral loss, pinned loaders, non_blocking, etc.)
-"""
-
+import os, json, argparse, math, time
 from pathlib import Path
-import argparse, json, os, numpy as np, torch
+
+import numpy as np
+import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torch.amp import autocast, GradScaler
 
 # ---------------------------
-# Device & perf knobs
+# Defaults
 # ---------------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
-
-try:
-    torch.backends.cudnn.benchmark = True
-except Exception:
-    pass
-
-# Prefer PyTorch 2.x matmul precision hint (keeps TF32 on Ampere+)
-try:
-    torch.set_float32_matmul_precision("high")
-except Exception:
-    pass
-
-SEED = 42
-SPECTRAL_WEIGHT_DEFAULT = 2.0
-BATCH_SIZE_DEFAULT = 2048
-EPOCHS_DEFAULT = 300
-LR_DEFAULT = 1e-4
+CKPT_DEFAULT = "mlp_denoiser.pt"
+EPOCHS_DEFAULT = 50
+BATCH_SIZE_DEFAULT = 512
+LR_DEFAULT = 1e-3
 WEIGHT_DECAY_DEFAULT = 1e-4
-PDROP_DEFAULT = 0.1
-HIDDEN_DEFAULT = [2048, 1024, 512]
-CKPT_DEFAULT = "mlp_npz_best.pt"
+SPECTRAL_WEIGHT_DEFAULT = 0.0
+PDROP_DEFAULT = 0.0
 
-rng = np.random.default_rng(SEED)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
-# ---------------------------
-# NPZ loading & shapes
-# ---------------------------
-def _to_flat_2win(arr):
-    arr = np.asarray(arr)
-    if arr.ndim == 3:
-        if arr.shape[1] == 2:
-            I, Q = arr[:, 0, :], arr[:, 1, :]
-        elif arr.shape[-1] == 2:
-            I, Q = arr[:, :, 0], arr[:, :, 1]
-        else:
-            raise ValueError(f"3D array not recognized: {arr.shape}")
-        flat = np.concatenate([I, Q], axis=1).astype(np.float32)
-        return flat, I.shape[1]
-    elif arr.ndim == 2:
-        F = arr.shape[1]
-        if F % 2 != 0:
-            raise ValueError(f"Feature dim {F} not even; cannot split I/Q.")
-        return arr.astype(np.float32), F // 2
-    else:
-        raise ValueError(f"Unsupported shape {arr.shape}")
-
-def _have(D, *ks): return all(k in D for k in ks)
-
-def load_npz_dataset(p: Path):
-    D = np.load(p, allow_pickle=True)
-    keys = set(D.files)
-    print(f"[NPZ] Keys: {sorted(keys)}")
-
-    def flat2(kx, ky):
-        Xf, w1 = _to_flat_2win(D[kx]); Yf, w2 = _to_flat_2win(D[ky])
-        if w1 != w2:
-            raise ValueError("Window mismatch X vs Y")
-        return Xf, Yf, w1
-
-    if _have(D, 'X_train', 'Y_train', 'X_val', 'Y_val'):
-        Xtr, Ytr, w = flat2('X_train', 'Y_train')
-        Xva, Yva, _ = flat2('X_val', 'Y_val')
-        Xte = Yte = None
-        if _have(D, 'X_test', 'Y_test'):
-            Xte, Yte, _ = flat2('X_test', 'Y_test')
-        return Xtr, Ytr, Xva, Yva, Xte, Yte, w
-
-    if _have(D, 'Xtr', 'Ytr', 'Xva', 'Yva'):
-        Xtr, Ytr, w = flat2('Xtr', 'Ytr')
-        Xva, Yva, _ = flat2('Xva', 'Yva')
-        Xte = Yte = None
-        if _have(D, 'Xte', 'Yte'):
-            Xte, Yte, _ = flat2('Xte', 'Yte')
-        return Xtr, Ytr, Xva, Yva, Xte, Yte, w
-
-    if _have(D, 'X', 'Y') and _have(D, 'split'):
-        X, Y, w = flat2('X', 'Y')
-        S = np.asarray(D['split']).astype(np.int32)
-        mtr, mva, mte = (S == 0), (S == 1), (S == 2)
-        return X[mtr], Y[mtr], X[mva], Y[mva], X[mte], Y[mte], w
-
-    if _have(D, 'X', 'Y'):
-        X, Y, w = flat2('X', 'Y')
-        N = len(X); idx = np.arange(N); rng.shuffle(idx)
-        nte = max(1, int(0.15 * N)); nva = max(1, int(0.15 * N))
-        te, va, tr = idx[:nte], idx[nte:nte + nva], idx[nte + nva:]
-        return X[tr], Y[tr], X[va], Y[va], X[te], Y[te], w
-
-    raise SystemExit("Unrecognized NPZ structure.")
 
 # ---------------------------
-# Complex helpers & alignment
+# Dataset
 # ---------------------------
-def _flat_to_complex(F, win):
-    I = F[:, :win]; Q = F[:, win:]
-    return I.astype(np.float64) + 1j * Q.astype(np.float64)
+class IQDataset(Dataset):
+    def __init__(self, X: np.ndarray, Y: np.ndarray):
+        # flatten from axis=1 onward, keep N as is
+        if X.ndim > 2:
+            X = X.reshape(X.shape[0], -1)
+        if Y.ndim > 2:
+            Y = Y.reshape(Y.shape[0], -1)
+        self.X = torch.from_numpy(X.astype(np.float32, copy=False))
+        self.Y = torch.from_numpy(Y.astype(np.float32, copy=False))
 
-def _complex_to_flat(Z, win, dtype=np.float32):
-    I = Z.real.astype(dtype); Q = Z.imag.astype(dtype)
-    return np.concatenate([I, Q], axis=1)
+    def __len__(self):
+        return self.X.shape[0]
 
-def align_X_to_Y_least_squares(X_flat, Y_flat, win):
-    Xc = _flat_to_complex(X_flat, win)
-    Yc = _flat_to_complex(Y_flat, win)
-    num = np.sum(np.conjugate(Xc) * Yc, axis=1)
-    den = np.sum(np.conjugate(Xc) * Xc, axis=1) + 1e-12
-    a = num / den
-    Xc_al = (a[:, None] * Xc)
-    return _complex_to_flat(Xc_al, win, dtype=np.float32)
+    def __getitem__(self, i):
+        return self.X[i], self.Y[i]
+
 
 # ---------------------------
-# Dataset & Model
+# Model: residual-output MLP (y_hat = x_norm + r_hat)
 # ---------------------------
-class PairDataset(Dataset):
-    def __init__(self, X, R):
-        self.X = torch.from_numpy(X.astype(np.float32))
-        self.R = torch.from_numpy(R.astype(np.float32))
-    def __len__(self): return self.X.shape[0]
-    def __getitem__(self, i): return self.X[i], self.R[i]
-
 class ResOutMLP(nn.Module):
-    def __init__(self, in_dim, hidden, dropout=0.1):
+    """
+    Predicts a residual correction r_hat so that y_hat = x_norm + r_hat.
+    Body: [Linear -> GELU -> (Dropout)] x L, with a LayerNorm on input.
+    """
+    def __init__(self, in_dim: int, hidden: list[int], dropout: float = 0.0):
         super().__init__()
-        layers = []; prev = in_dim
+        self.in_norm = nn.LayerNorm(in_dim)
+        layers = []
+        prev = in_dim
         for h in hidden:
-            layers += [nn.Linear(prev, h), nn.ReLU(inplace=True)]
-            if dropout > 0: layers += [nn.Dropout(dropout)]
+            layers += [nn.Linear(prev, h), nn.GELU()]
+            if dropout > 0:
+                layers += [nn.Dropout(dropout)]
             prev = h
         self.body = nn.Sequential(*layers)
         self.head = nn.Linear(prev, in_dim)
+        # small init on the head helps stabilize residual learning
         nn.init.normal_(self.head.weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.head.bias)
+
     def forward(self, x):
-        r = self.head(self.body(x))
-        y_hat = x + r
-        return y_hat, r
+        x_n = self.in_norm(x)
+        r_hat = self.head(self.body(x_n))
+        y_hat = x_n + r_hat  # residual correction applied to normalized input
+        # Return prediction, residual, and normalized input (for metrics/loss)
+        return y_hat, r_hat, x_n
+
 
 # ---------------------------
-# Losses & Metrics
+# Spectral losses
 # ---------------------------
-def spectral_loss(x_hat: torch.Tensor, y: torch.Tensor, win: int) -> torch.Tensor:
-    xh = x_hat.float()
-    yt = y.float()
-    Ih, Qh = xh[:, :win], xh[:, win:]
-    Iy, Qy = yt[:, :win], yt[:, win:]
-    def _pshape(t):
-        F = torch.fft.rfft(t, dim=1)
-        P = (F.real**2 + F.imag**2)
-        P = P / (P.sum(dim=1, keepdim=True) + 1e-12)
-        return P
-    Ph = _pshape(Ih) + _pshape(Qh)
-    Py = _pshape(Iy) + _pshape(Qy)
-    return torch.mean((Ph - Py)**2)
+def spectral_loss(y_hat: torch.Tensor,
+                  y_true: torch.Tensor,
+                  power: float = 1.0) -> torch.Tensor:
+    """
+    Single-resolution magnitude-spectrum MSE using rFFT along the last dim.
+    """
+    y_hat = y_hat.float()
+    y_true = y_true.float()
+    Yh = torch.fft.rfft(y_hat, dim=-1)
+    Yt = torch.fft.rfft(y_true, dim=-1)
+    Mh = (Yh.abs() + 1e-8) ** power
+    Mt = (Yt.abs() + 1e-8) ** power
+    return torch.mean((Mh - Mt) ** 2)
 
-def sdr_db(ref, est):
-    num = np.sum(np.abs(ref)**2) + 1e-12
-    den = np.sum(np.abs(ref - est)**2) + 1e-12
-    return 10 * np.log10(num / den)
 
-def evm_pct(ref, est):
-    num = np.mean(np.abs(ref - est)**2)
-    den = np.mean(np.abs(ref)**2) + 1e-12
-    return 100 * np.sqrt(num / den)
+def mr_spectral_loss(y_hat: torch.Tensor,
+                     y_true: torch.Tensor,
+                     sizes: list[int],
+                     logmag: bool = False,
+                     power: float = 1.0) -> torch.Tensor:
+    """
+    Multi-resolution spectral loss: average of per-size magnitude (or log-magnitude) MSEs.
+    """
+    y_hat = y_hat.float()
+    y_true = y_true.float()
+    tot = 0.0
+    count = 0
+    for n in sizes:
+        Yh = torch.fft.rfft(y_hat, n=n, dim=-1)
+        Yt = torch.fft.rfft(y_true, n=n, dim=-1)
+        Mh = (Yh.abs() + 1e-8)
+        Mt = (Yt.abs() + 1e-8)
+        if logmag:
+            Mh = Mh.log()
+            Mt = Mt.log()
+        else:
+            Mh = Mh ** power
+            Mt = Mt ** power
+        tot = tot + torch.mean((Mh - Mt) ** 2)
+        count += 1
+    return tot / max(1, count)
 
-# ---------------------------
-# Train
-# ---------------------------
-def train_one(args):
-    torch.manual_seed(SEED); np.random.seed(SEED)
 
-    Xtr, Ytr, Xva, Yva, Xte, Yte, WIN = load_npz_dataset(Path(args.data))
+def make_spec_fn(args, in_dim: int):
+    """
+    Returns a function spec_fn(y_hat, y_true) -> scalar tensor based on args.
+    If spec_weight <= 0, returns a no-op fn.
+    """
+    if args.spec_weight <= 0:
+        return lambda yh, yt: yh.new_zeros(())
 
-    # Optional complex gain/phase alignment
-    Xtr = align_X_to_Y_least_squares(Xtr, Ytr, WIN)
-    Xva = align_X_to_Y_least_squares(Xva, Yva, WIN)
-    if Xte is not None and Yte is not None:
-        Xte = align_X_to_Y_least_squares(Xte, Yte, WIN)
+    if args.mr_spec:
+        if args.mr_scales:
+            try:
+                sizes = json.loads(args.mr_scales)
+                assert isinstance(sizes, list) and all(isinstance(x, int) and x > 0 for x in sizes)
+            except Exception:
+                raise ValueError(f"Invalid --mr_scales '{args.mr_scales}'. Use JSON list, e.g. \"[D, D//2, D//4]\".")
+        else:
+            # sensible defaults from feature dim
+            D = in_dim
+            sizes = sorted(set([D, max(D // 2, 8), max(D // 4, 8)]), reverse=True)
 
-    # Normalize
-    mu = Xtr.mean(0, keepdims=True); sd = Xtr.std(0, keepdims=True) + 1e-8
-    Xtrn = (Xtr - mu) / sd; Xvan = (Xva - mu) / sd
-    Ytrn = (Ytr - mu) / sd; Yvan = (Yva - mu) / sd
-    if Xte is not None:
-        Xten = (Xte - mu) / sd; Yten = (Yte - mu) / sd
+        def _spec(yh, yt):
+            return mr_spectral_loss(yh, yt, sizes=sizes, logmag=args.mr_log, power=1.0)
+        return _spec
     else:
-        Xten = Yten = None
+        return lambda yh, yt: spectral_loss(yh, yt, power=1.0)
 
-    # Residual targets
-    Rtr, Rva = Ytrn - Xtrn, Yvan - Xvan
-    Rte = Yten - Xten if Xten is not None else None
 
-    train_ds = PairDataset(Xtrn, Rtr)
-    val_ds   = PairDataset(Xvan, Rva)
-    test_ds  = PairDataset(Xten, Rte) if Xten is not None else None
+# ---------------------------
+# Utils
+# ---------------------------
+def count_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    num_workers = args.workers if args.workers is not None else min(8, os.cpu_count() or 8)
 
-    tr_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=args.prefetch
-    )
-    va_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=args.prefetch
-    )
-    te_loader = DataLoader(
-        test_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=args.prefetch
-    ) if test_ds else None
+def parse_hidden(s: str | None, in_dim: int) -> list[int]:
+    if s is None:
+        # sensible wide default; user can override with --hidden
+        return [1024, 2048, 4096]
+    try:
+        h = json.loads(s)
+        assert isinstance(h, list) and all(isinstance(x, int) and x > 0 for x in h)
+        return h
+    except Exception:
+        raise ValueError(f"Invalid --hidden '{s}'. Use JSON list, e.g. \"[1024,2048,4096]\".")
 
-    in_dim = Xtrn.shape[1]
-    hidden = HIDDEN_DEFAULT if args.hidden is None else json.loads(args.hidden)
-    model = ResOutMLP(in_dim, hidden, dropout=args.pdrop).to(device)
 
-    # Optional compile (disabled by default; safe fallback)
-    if args.compile:
-        try:
-            model = torch.compile(model)
-            print("[info] torch.compile enabled")
-        except Exception as e:
-            print(f"[warn] torch.compile unavailable/failed: {e}\n[warn] continuing without compilation")
+def init_ema(model: nn.Module):
+    return [p.detach().clone() for p in model.parameters()]
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=3)
-    huber = nn.SmoothL1Loss(beta=1.0)
 
-    use_amp = args.amp and device.type == "cuda"
-    scaler = GradScaler("cuda", enabled=use_amp)
+@torch.no_grad()
+def ema_update(model: nn.Module, ema_params, decay: float):
+    for p, e in zip(model.parameters(), ema_params):
+        e.mul_(decay).add_(p.data, alpha=1.0 - decay)
 
-    def loss_fn(y_hat, r_hat, x, r_tgt):
-        l_res = huber(r_hat, r_tgt)
-        spec  = spectral_loss(y_hat, x + r_tgt, win=WIN) if args.spec_weight > 0 else torch.tensor(0.0, device=y_hat.device)
-        return l_res + args.spec_weight * spec, (l_res, spec)
 
-    best = (1e9, None)
-    for ep in range(1, args.epochs + 1):
-        model.train()
-        tr_loss = lrs = lsp = 0.0; n = 0
+@torch.no_grad()
+def swap_to_ema(model: nn.Module, ema_params):
+    backup = [p.detach().clone() for p in model.parameters()]
+    for p, e in zip(model.parameters(), ema_params):
+        p.copy_(e)
+    return backup
 
-        for xb, rb in tr_loader:
-            xb = xb.to(device, non_blocking=True)
-            rb = rb.to(device, non_blocking=True)
 
-            opt.zero_grad(set_to_none=True)
-            if use_amp:
-                with autocast("cuda", enabled=True):
-                    y_hat, r_hat = model(xb)
-                    loss, (l_res, l_spec) = loss_fn(y_hat, r_hat, xb, rb)
-                scaler.scale(loss).backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(opt)
-                scaler.update()
-            else:
-                y_hat, r_hat = model(xb)
-                loss, (l_res, l_spec) = loss_fn(y_hat, r_hat, xb, rb)
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
+@torch.no_grad()
+def restore_from_backup(model: nn.Module, backup):
+    for p, b in zip(model.parameters(), backup):
+        p.copy_(b)
 
-            bs = xb.size(0)
-            tr_loss += float(loss.detach()) * bs
-            lrs     += float(l_res.detach()) * bs
-            lsp     += float(l_spec.detach()) * bs
-            n       += bs
 
-        tr_loss /= n; lrs /= n; lsp /= n
+# ---------------------------
+# Training / Validation
+# ---------------------------
+def train_one_epoch(model, opt, scaler, dl, device, spec_w, spec_fn, clip_grad, ema_params, ema_decay):
+    model.train()
+    mse = nn.MSELoss()
+    total, res_sum, spec_sum = 0.0, 0.0, 0.0
 
-        # ---- Val ----
-        model.eval(); va_loss = 0.0; m = 0
-        with torch.no_grad():
-            for xb, rb in va_loader:
-                xb = xb.to(device, non_blocking=True)
-                rb = rb.to(device, non_blocking=True)
-                if use_amp:
-                    with autocast("cuda", enabled=True):
-                        y_hat, r_hat = model(xb)
-                        l, _ = loss_fn(y_hat, r_hat, xb, rb)
-                else:
-                    y_hat, r_hat = model(xb)
-                    l, _ = loss_fn(y_hat, r_hat, xb, rb)
-                va_loss += float(l) * xb.size(0); m += xb.size(0)
-        va_loss /= m
-        sched.step(va_loss)
+    for x, y in dl:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=scaler is not None):
+            y_hat, r_hat, x_norm = model(x)
+            r_tgt = y - x_norm
+            l_res = mse(r_hat, r_tgt)
+            l_spec = spec_fn(y_hat, y) if spec_w > 0 else y_hat.new_zeros(())
+            loss = l_res + spec_w * l_spec
 
-        print(f"Epoch {ep:03d} | train {tr_loss:.5f} (res {lrs:.5f}, spec {lsp:.5f}) | val {va_loss:.5f}")
+        opt.zero_grad(set_to_none=True)
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            if clip_grad > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            if clip_grad > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            opt.step()
 
-        if va_loss < best[0]:
-            best = (va_loss, {
-                "model": model.state_dict(),
-                "in_dim": in_dim,
-                "hidden": hidden,
-                "window": WIN,
-                "mu": mu, "sd": sd
-            })
-            torch.save(best[1], args.ckpt)
+        # EMA update after optimizer step
+        if ema_params is not None:
+            ema_update(model, ema_params, ema_decay)
 
-    print(f"\nBest val loss: {best[0]:.6f} | saved -> {args.ckpt}")
+        bs = x.shape[0]
+        total += loss.detach().item() * bs
+        res_sum += l_res.detach().item() * bs
+        spec_sum += (l_spec.detach().item() if spec_w > 0 else 0.0) * bs
 
-    # ---- Test metrics ----
-    if te_loader is not None:
-        state = best[1]
-        model.load_state_dict(state["model"])
-        model.eval()
-        outs = []
-        with torch.no_grad():
-            for xb, _ in te_loader:
-                xb = xb.to(device, non_blocking=True)
-                if use_amp:
-                    with autocast("cuda", enabled=True):
-                        y_hat, _ = model(xb)
-                else:
-                    y_hat, _ = model(xb)
-                outs.append(y_hat.detach().cpu().numpy())
-        Yhat = np.concatenate(outs, 0)
+    n = len(dl.dataset)
+    return total / n, res_sum / n, spec_sum / max(1, n)
 
-        # de-normalize
-        Xte_den = Xten * sd + mu
-        Yte_den = Yten * sd + mu
-        Yhat_den = Yhat * sd + mu
 
-        def flat_to_complex(F, win):
-            I = F[:, :win]; Q = F[:, win:]
-            return I + 1j * Q
+@torch.no_grad()
+def validate(model, dl, device, spec_w, spec_fn):
+    model.eval()
+    mse = nn.MSELoss()
+    total, res_sum, spec_sum = 0.0, 0.0, 0.0
 
-        xin_c = flat_to_complex(Xte_den, WIN)
-        y_c   = flat_to_complex(Yte_den, WIN)
-        yh_c  = flat_to_complex(Yhat_den, WIN)
+    for x, y in dl:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        y_hat, r_hat, x_norm = model(x)
+        r_tgt = y - x_norm
+        l_res = mse(r_hat, r_tgt)
+        l_spec = spec_fn(y_hat, y) if spec_w > 0 else y_hat.new_zeros(())
+        loss = l_res + spec_w * l_spec
 
-        sdr_in  = float(np.mean([sdr_db(y, x)    for x, y    in zip(xin_c, y_c)]))
-        sdr_out = float(np.mean([sdr_db(y, yhat) for y, yhat in zip(y_c, yh_c)]))
-        evm_in  = float(np.mean([evm_pct(y, x)    for x, y    in zip(xin_c, y_c)]))
-        evm_out = float(np.mean([evm_pct(y, yhat) for y, yhat in zip(y_c, yh_c)]))
+        bs = x.shape[0]
+        total += loss.item() * bs
+        res_sum += l_res.item() * bs
+        spec_sum += (l_spec.item() if spec_w > 0 else 0.0) * bs
 
-        print("\n=== TEST METRICS ===")
-        print(f"SDR   in : {sdr_in:6.2f} dB | out : {sdr_out:6.2f} dB | Δ: {sdr_out - sdr_in:+6.2f} dB")
-        print(f"EVM%  in : {evm_in:6.2f}% | out : {evm_out:6.2f}% | Δ: {evm_out - evm_in:+6.2f}%")
+    n = len(dl.dataset)
+    return total / n, res_sum / n, spec_sum / max(1, n)
+
+
+# ---------------------------
+# Metrics (EVM% and SNR dB)
+# ---------------------------
+@torch.no_grad()
+def compute_evm_snr(model: nn.Module, dl: DataLoader, device: torch.device):
+    """
+    Computes:
+      - EVM_in %  between x_norm and y
+      - EVM_out % between y_hat and y
+      - SNR_in dB  = 10*log10(||y||^2 / ||x_norm - y||^2)
+      - SNR_out dB = 10*log10(||y||^2 / ||y_hat - y||^2)
+      - Δ = SNR_out - SNR_in
+    Aggregated over the entire dataloader.
+    """
+    model.eval()
+    eps = 1e-12
+    num_y = 0.0
+    err_in = 0.0
+    err_out = 0.0
+
+    for x, y in dl:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        y_hat, _, x_norm = model(x)
+
+        # Accumulate in float64 for numeric stability
+        y_d = y.double()
+        in_err = (x_norm.double() - y_d)
+        out_err = (y_hat.double() - y_d)
+
+        num_y += torch.sum(y_d * y_d).item()
+        err_in += torch.sum(in_err * in_err).item()
+        err_out += torch.sum(out_err * out_err).item()
+
+    # EVM% (RMS)
+    evm_in_pct = 100.0 * math.sqrt(max(err_in, 0.0) / max(num_y, eps))
+    evm_out_pct = 100.0 * math.sqrt(max(err_out, 0.0) / max(num_y, eps))
+
+    # SNR (dB)
+    snr_in = 10.0 * math.log10(max(num_y, eps) / max(err_in, eps))
+    snr_out = 10.0 * math.log10(max(num_y, eps) / max(err_out, eps))
+    snr_delta = snr_out - snr_in
+
+    return evm_in_pct, evm_out_pct, snr_in, snr_out, snr_delta
+
 
 # ---------------------------
 # CLI
 # ---------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="NPZ MLP denoiser (CUDA-optimized, cluster-safe)")
+    p = argparse.ArgumentParser(description="NPZ MLP denoiser (residual target, GELU+LayerNorm, cosine warmup)")
     p.add_argument("--data", type=str, required=True, help="Path to NPZ dataset")
     p.add_argument("--ckpt", type=str, default=CKPT_DEFAULT)
     p.add_argument("--epochs", type=int, default=EPOCHS_DEFAULT)
@@ -384,19 +321,197 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY_DEFAULT)
     p.add_argument("--spec_weight", type=float, default=SPECTRAL_WEIGHT_DEFAULT)
     p.add_argument("--pdrop", type=float, default=PDROP_DEFAULT)
-    p.add_argument("--hidden", type=str, default=None, help='JSON list, e.g. "[4096,2048,1024]"')
+    p.add_argument("--hidden", type=str, default=None, help='JSON list, e.g. "[1024,2048,4096]"')
     p.add_argument("--workers", type=int, default=None, help="DataLoader workers (default=min(8, cpu_count))")
     p.add_argument("--prefetch", type=int, default=4, help="DataLoader prefetch_factor")
     p.add_argument("--amp", action="store_true", default=True, help="Enable mixed precision (AMP)")
     p.add_argument("--no-amp", dest="amp", action="store_false")
-    # default compile=False to avoid Triton/libcuda issues in Singularity
-    p.add_argument("--compile", action="store_true", default=False, help="Enable torch.compile (requires libcuda in container)")
+    p.add_argument("--compile", action="store_true", default=False, help="Enable torch.compile if available")
     p.add_argument("--no-compile", dest="compile", action="store_false")
+    # LR schedule
+    p.add_argument("--warmup_epochs", type=int, default=3, help="Linear LR warmup epochs")
+    p.add_argument("--eta_min", type=float, default=0.0, help="Cosine min LR (0 -> 0.05*lr)")
+    # Extras
+    p.add_argument("--ema", type=float, default=0.0, help="EMA decay (0 disables, e.g., 0.999)")
+    p.add_argument("--spec_warmup", type=int, default=5, help="Epochs to ramp spec_weight 0→target")
+    p.add_argument("--spec_autobalance", action="store_true", help="Scale spec_weight by res/spec ratio each epoch")
+    p.add_argument("--clip_grad", type=float, default=0.0, help="Global grad-norm clip (0 disables)")
+    # MR spectral loss
+    p.add_argument("--mr_spec", action="store_true", help="Use multi-resolution spectral loss")
+    p.add_argument("--mr_log", action="store_true", help="Use log-magnitude in MR spectral loss")
+    p.add_argument("--mr_scales", type=str, default=None, help='JSON list of FFT sizes, e.g. "[D, D//2, D//4]"')
     return p.parse_args()
+
 
 def main():
     args = parse_args()
-    train_one(args)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---------------------------
+    # Load NPZ
+    # ---------------------------
+    npz = np.load(args.data, allow_pickle=True)
+    keys = list(npz.keys())
+    print(f"[NPZ] Keys: {keys}")
+    Xtr = npz["Xtr"]; Ytr = npz["Ytr"]
+    Xva = npz["Xva"]; Yva = npz["Yva"]
+    meta = npz.get("meta", None)
+    if meta is not None:
+        try:
+            print(f"[meta] {meta.item() if hasattr(meta, 'item') else meta}")
+        except Exception:
+            pass
+
+    tr_set = IQDataset(Xtr, Ytr)
+    va_set = IQDataset(Xva, Yva)
+
+    in_dim = tr_set.X.shape[1]
+    hidden = parse_hidden(args.hidden, in_dim)
+
+    workers = args.workers
+    if workers is None:
+        workers = min(8, max(0, (os.cpu_count() or 4) - 1))
+
+    prefetch = args.prefetch if workers > 0 else None
+
+    tr_loader = DataLoader(
+        tr_set, batch_size=args.batch_size, shuffle=True,
+        num_workers=workers, pin_memory=True, prefetch_factor=prefetch, persistent_workers=(workers > 0)
+    )
+    va_loader = DataLoader(
+        va_set, batch_size=args.batch_size, shuffle=False,
+        num_workers=workers, pin_memory=True, prefetch_factor=prefetch, persistent_workers=(workers > 0)
+    )
+
+    # ---------------------------
+    # Build model
+    # ---------------------------
+    model = ResOutMLP(in_dim=in_dim, hidden=hidden, dropout=args.pdrop).to(device)
+    if args.compile and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model, mode="max-autotune")
+            print("[info] torch.compile enabled")
+        except Exception as e:
+            print(f"[warn] torch.compile failed: {e}")
+
+    params = count_params(model)
+    print(f"Device: {device.type} | Params: {params/1e6:.2f}M | InDim: {in_dim} | Hidden: {hidden}")
+
+    # ---------------------------
+    # Optimizer (weight-decay hygiene) & Scheduler
+    # ---------------------------
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if p.ndim == 1 or "norm" in n.lower() or n.endswith(".bias"):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    opt = torch.optim.AdamW(
+        [{"params": decay, "weight_decay": args.weight_decay},
+         {"params": no_decay, "weight_decay": 0.0}],
+        lr=args.lr, betas=(0.9, 0.99)
+    )
+
+    warmup_epochs = max(0, int(args.warmup_epochs))
+    cos_epochs = max(1, args.epochs - warmup_epochs)
+    eta_min = (0.05 * args.lr) if args.eta_min == 0.0 else args.eta_min
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cos_epochs, eta_min=eta_min)
+
+    scaler = torch.cuda.amp.GradScaler() if (args.amp and device.type == "cuda") else None
+
+    # EMA setup
+    ema_params = init_ema(model) if args.ema > 0 else None
+
+    # Spectral loss function
+    spec_fn = make_spec_fn(args, in_dim)
+
+    # ---------------------------
+    # Train
+    # ---------------------------
+    best_val = float("inf")
+    since = time.time()
+    last_ratio = 1.0  # for spec_autobalance (res/spec)
+    for ep in range(1, args.epochs + 1):
+        # LR Warmup
+        if ep <= warmup_epochs:
+            w = ep / max(1, warmup_epochs)
+            for g in opt.param_groups:
+                g["lr"] = args.lr * w
+
+        # Spec schedule for this epoch
+        spec_w = args.spec_weight
+        if args.spec_warmup > 0 and ep <= args.spec_warmup:
+            spec_w *= (ep / max(1, args.spec_warmup))
+        # Apply auto-balance based on last epoch's ratio
+        if args.spec_autobalance:
+            spec_w *= max(0.2, min(5.0, last_ratio))
+
+        tr_loss, tr_res, tr_spec = train_one_epoch(
+            model, opt, scaler, tr_loader, device,
+            spec_w=spec_w, spec_fn=spec_fn,
+            clip_grad=args.clip_grad,
+            ema_params=ema_params, ema_decay=args.ema if args.ema > 0 else 0.0
+        )
+
+        # Update ratio for next epoch (avoid div by zero)
+        if tr_spec > 0:
+            last_ratio = tr_res / (tr_spec + 1e-12)
+
+        va_loss, va_res, va_spec = validate(
+            model, va_loader, device, spec_w=spec_w, spec_fn=spec_fn
+        )
+
+        # After warmup, step cosine
+        if ep > warmup_epochs:
+            cosine.step()
+
+        curr_lr = opt.param_groups[0]["lr"]
+        print(
+            f"Epoch {ep:03d} | "
+            f"train {tr_loss:.5f} (res {tr_res:.5f}, spec {tr_spec:.5f}) | "
+            f"val {va_loss:.5f} | lr {curr_lr:.2e} | spec_w_eff {spec_w:.3g}"
+        )
+
+        # Save best (prefer EMA weights if enabled)
+        if va_loss < best_val:
+            best_val = va_loss
+            if ema_params is not None:
+                backup = swap_to_ema(model, ema_params)
+            torch.save(
+                {"model": model.state_dict(),
+                 "in_dim": in_dim,
+                 "hidden": hidden,
+                 "args": vars(args),
+                 "val_loss": best_val},
+                args.ckpt,
+            )
+            print(f"  ↳ saved -> {args.ckpt}")
+            if ema_params is not None:
+                restore_from_backup(model, backup)
+
+    total_time = time.time() - since
+    print(f"Done. Best val {best_val:.6f} | time {total_time/60:.2f} min")
+
+    # ---------------------------
+    # Evaluate best checkpoint on validation set (EVM% and SNR)
+    # ---------------------------
+    print("=== Evaluating best checkpoint on validation set ===")
+    ckpt = torch.load(args.ckpt, map_location=device)
+    eval_model = ResOutMLP(in_dim=ckpt.get("in_dim", in_dim),
+                           hidden=ckpt.get("hidden", hidden),
+                           dropout=args.pdrop).to(device)
+    eval_model.load_state_dict(ckpt["model"])
+    evm_in, evm_out, snr_in, snr_out, snr_delta = compute_evm_snr(eval_model, va_loader, device)
+
+    print(
+        f"=== VALIDATION METRICS ===\n"
+        f"EVM_in   : {evm_in:.3f}%\n"
+        f"EVM_out  : {evm_out:.3f}%\n"
+        f"SNR_in   : {snr_in:.2f} dB\n"
+        f"SNR_out  : {snr_out:.2f} dB\n"
+        f"Δ SNR    : {snr_delta:+.2f} dB"
+    )
+
 
 if __name__ == "__main__":
     main()

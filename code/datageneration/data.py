@@ -182,9 +182,12 @@ def _make_example(cfg: GenCfg, rng: np.random.Generator):
         x = _add_awgn(x, snr, rng)
         meta["snr_db"] = float(snr)
 
-    # Final RMS norm improves training stability
-    x = _rms_norm(x)
-    y = _rms_norm(clean)
+    # OPTION A: Normalize input-target pairs together
+    # Compute RMS from noisy input only
+    x_rms = np.sqrt(np.mean(np.abs(x)**2) + 1e-12)
+    # Apply the same scaling factor to both input AND target
+    x = (x / x_rms).astype(np.complex64)
+    y = (clean / x_rms).astype(np.complex64)
 
     return _flatten_ri(x), _flatten_ri(y), meta
 
@@ -215,7 +218,7 @@ def _build_dataset(n_total: int, cfg: GenCfg, seed: int):
         "seed": seed,
         "n_train": n_train,
         "n_val": n_val,
-        "desc": "Synthetic BPSK with optional wide sweeping CW + AWGN"
+        "desc": "Synthetic BPSK with optional wide sweeping CW + AWGN (Option A RMS normalization)"
     }
     return (Xtr, Ytr, Xva, Yva, meta, Mtr, Mva)
 
