@@ -49,7 +49,7 @@ class GenCfg:
 
     # Impairments
     max_cfo_hz: float = 5e3          # uniform in [-max, +max]
-    enable_cfo: bool = True
+    enable_cfo: bool = False
 
     # Random seed default (can be overridden via CLI)
     seed: int = 1337
