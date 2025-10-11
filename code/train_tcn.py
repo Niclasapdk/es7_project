@@ -512,6 +512,15 @@ def main():
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         (model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model).load_state_dict(ckpt["model"], strict=True)
+        # If we have an EMA object and the checkpoint carries ema_state, restore it
+    if ema is not None and isinstance(ckpt, dict) and ("ema_state" in ckpt):
+        for n, p in ema.shadow.items():
+            if n in ckpt["ema_state"]:
+                p.copy_(ckpt["ema_state"][n].to(p.device))
+        only_rank0_print("[resume] Restored EMA shadow from checkpoint.")
+    elif ema is not None:
+        only_rank0_print("[resume] No ema_state in checkpoint; will create/save it now.")
+
         if args.resume_all and "opt" in ckpt and "sched" in ckpt:
             try:
                 opt.load_state_dict(ckpt["opt"]); scheduler.load_state_dict(ckpt["sched"])
@@ -538,14 +547,23 @@ def main():
                   f"cov {val['ref_cov']:.1f}% | lr {scheduler.get_last_lr()[0]:.2e} | {sec/60:.02f} min")
             if val['loss'] < best_val:
                 best_val = val['loss']
+                base_model = (model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model)
                 to_save = {
-                    "model": (model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model).state_dict(),
-                    "opt": opt.state_dict(), "sched": scheduler.state_dict(),
+                    "model": base_model.state_dict(),
+                    "opt": opt.state_dict(),
+                    "sched": scheduler.state_dict(),
                     "scaler": (scaler.state_dict() if scaler is not None else {}),
-                    "args": vars(args)
+                    "args": vars(args),
                 }
+                # NEW: persist EMA so eval/visualize can load the validated weights
+                if ema is not None:
+                    to_save["ema_state"] = {k: v.detach().clone() for k, v in ema.shadow.items()}
+                    to_save["ema_decay"] = ema.decay
+                    to_save["eval_used_ema"] = bool(args.eval_use_ema)
+
                 torch.save(to_save, args.out)
                 print(f"  ↳ saved -> {args.out}")
+
 
     with torch.no_grad():
         te = evaluate(model, loss_fn, dl_te, device, args.H, use_ema=(ema if args.eval_use_ema else None))
