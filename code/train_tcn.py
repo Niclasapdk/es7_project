@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # train_tcn.py — DDP-ready Causal TCN denoiser with robust EVM/SNR + hardened loader
-# (from-scratch friendly; EMA-safe resume; dual-best saving; clean EMA export)
 
 import os, math, argparse, time, random
 from pathlib import Path
@@ -44,6 +43,7 @@ def all_reduce_sum_(t: torch.Tensor) -> torch.Tensor:
 class IQWindows(Dataset):
     """Sliding windows [W] over sequences [N, T, 2]."""
     def __init__(self, X: np.ndarray, Y: np.ndarray, W: int, H: int):
+        # Hardened: coerce to contiguous float32 tensors here too
         if not (X.ndim == 3 and Y.ndim == 3 and X.shape[-1] == 2 and Y.shape[-1] == 2):
             raise ValueError(f"IQWindows expects [N,T,2] but got X {X.shape}, Y {Y.shape}")
         if X.shape != Y.shape:
@@ -71,12 +71,16 @@ class IQWindows(Dataset):
         return torch.from_numpy(x), torch.from_numpy(y)
 
 def _canonicalize_bt2(a: np.ndarray) -> np.ndarray:
-    """Convert many RF dataset shapes into [N,T,2] float32."""
+    """
+    Convert many RF dataset shapes into [N,T,2] float32.
+    Handles complex, [N,2,T], [T,2], [T], [N,T], etc.
+    """
     a = np.asarray(a)
     if np.iscomplexobj(a):
         a = np.stack([a.real, a.imag], axis=-1)  # (..., 2)
 
     if a.ndim == 3 and a.shape[-1] == 2:
+        # [N,T,2] or [?, ?, 2]; assume batch-first if size-1 is plausible
         pass
     elif a.ndim == 3 and a.shape[1] == 2:  # [N,2,T] -> [N,T,2]
         a = np.transpose(a, (0, 2, 1))
@@ -89,6 +93,7 @@ def _canonicalize_bt2(a: np.ndarray) -> np.ndarray:
     else:
         raise ValueError(f"Cannot canonicalize array of shape {a.shape} to [N,T,2]")
 
+    # If last dim somehow not 2, try to coerce
     if a.shape[-1] != 2:
         if a.shape[-1] == 1:
             a = np.concatenate([a, np.zeros_like(a)], axis=-1)
@@ -97,15 +102,20 @@ def _canonicalize_bt2(a: np.ndarray) -> np.ndarray:
     return a.astype(np.float32, copy=False)
 
 def _align_xy(X: np.ndarray, Y: np.ndarray, label: str) -> Tuple[np.ndarray, np.ndarray]:
-    """If X and Y differ slightly in N or T, slice to common min dimensions."""
+    """
+    If X and Y differ slightly in N or T, slice to common min dimensions.
+    Logs what was changed (rank0).
+    """
     if X.shape == Y.shape: return X, Y
     Nx, Tx, _ = X.shape; Ny, Ty, _ = Y.shape
     N = min(Nx, Ny); T = min(Tx, Ty)
-    only_rank0_print(f"[data:{label}] Mismatch X {X.shape} vs Y {Y.shape} -> slicing to (N={N}, T={T})")
+    if ddp_rank() == 0:
+        only_rank0_print(f"[data:{label}] Mismatch X {X.shape} vs Y {Y.shape} -> slicing to (N={N}, T={T})")
     return X[:N, :T, :], Y[:N, :T, :]
 
 def _find_npz_keys(npz):
     keys = set(npz.files)
+    # Most common patterns
     triplets = [
         ("X_train","Y_train","X_val","Y_val","X_test","Y_test"),
         ("train_X","train_Y","val_X","val_Y","test_X","test_Y"),
@@ -116,6 +126,7 @@ def _find_npz_keys(npz):
         if {xtr,ytr,xva,yva,xte,yte}.issubset(keys):
             return {"train": (npz[xtr], npz[ytr]), "val": (npz[xva], npz[yva]), "test": (npz[xte], npz[yte])}
 
+    # Train/val only — split val into val/test
     pairs_no_test = [
         ("Xtr","Ytr","Xva","Yva"), ("X_tr","Y_tr","X_va","Y_va"),
         ("X_train","Y_train","X_val","Y_val"), ("train_X","train_Y","val_X","val_Y"),
@@ -127,6 +138,7 @@ def _find_npz_keys(npz):
             mid = max(1, Xva.shape[0] // 2)
             return {"train": (Xtr, Ytr), "val": (Xva[:mid], Yva[:mid]), "test": (Xva[mid:], Yva[mid:])}
 
+    # Single pair X/Y — make an 80/10/10 split
     if "X" in keys and "Y" in keys:
         X, Y = npz["X"], npz["Y"]; N = X.shape[0]
         ntr, nva = int(0.8*N), int(0.1*N)
@@ -138,18 +150,22 @@ def load_npz_dataset(path: str, W: int, H: int, batch: int, workers: int, prefet
     path = str(path); npz = np.load(path, allow_pickle=False)
     sets = _find_npz_keys(npz)
 
+    # Canonicalize to [N,T,2]
     Xtr, Ytr = _canonicalize_bt2(sets["train"][0]), _canonicalize_bt2(sets["train"][1])
     Xva, Yva = _canonicalize_bt2(sets["val"][0]),   _canonicalize_bt2(sets["val"][1])
     Xte, Yte = _canonicalize_bt2(sets["test"][0]),  _canonicalize_bt2(sets["test"][1])
 
+    # Align if off-by-one or similar mismatches exist
     Xtr, Ytr = _align_xy(Xtr, Ytr, "train")
     Xva, Yva = _align_xy(Xva, Yva, "val")
     Xte, Yte = _align_xy(Xte, Yte, "test")
 
+    # Effective window
     T_min = min(Xtr.shape[1], Xva.shape[1], Xte.shape[1])
     W_eff = min(int(W), int(T_min))
     if W_eff < W: only_rank0_print(f"[data] Requested W={W} exceeds dataset min T={T_min}. Clamping W -> {W_eff}.")
 
+    # Datasets
     ds_tr = IQWindows(Xtr, Ytr, W_eff, H)
     ds_va = IQWindows(Xva, Yva, W_eff, H)
     ds_te = IQWindows(Xte, Yte, W_eff, H)
@@ -160,16 +176,23 @@ def load_npz_dataset(path: str, W: int, H: int, batch: int, workers: int, prefet
     sampler_va = DistributedSampler(ds_va, shuffle=False) if ddp_world_size() > 1 else None
     sampler_te = DistributedSampler(ds_te, shuffle=False) if ddp_world_size() > 1 else None
 
+    # prefetch_factor is only valid if num_workers > 0
     dl_kwargs = dict(pin_memory=True, persistent_workers=(workers > 0), num_workers=workers)
     if workers > 0:
         dl_kwargs["prefetch_factor"] = prefetch
 
-    dl_tr = DataLoader(ds_tr, batch_size=batch, sampler=sampler_tr,
-                       shuffle=(sampler_tr is None), drop_last=True, **dl_kwargs)
-    dl_va = DataLoader(ds_va, batch_size=batch, sampler=sampler_va,
-                       shuffle=False, drop_last=False, **dl_kwargs)
-    dl_te = DataLoader(ds_te, batch_size=batch, sampler=sampler_te,
-                       shuffle=False, drop_last=False, **dl_kwargs)
+    dl_tr = DataLoader(
+        ds_tr, batch_size=batch, sampler=sampler_tr,
+        shuffle=(sampler_tr is None), drop_last=True, **dl_kwargs
+    )
+    dl_va = DataLoader(
+        ds_va, batch_size=batch, sampler=sampler_va,
+        shuffle=False, drop_last=False, **dl_kwargs
+    )
+    dl_te = DataLoader(
+        ds_te, batch_size=batch, sampler=sampler_te,
+        shuffle=False, drop_last=False, **dl_kwargs
+    )
     return ds_tr, ds_va, ds_te, dl_tr, dl_va, dl_te, W_eff
 
 # ---------------------------
@@ -202,19 +225,14 @@ class TCNBlock(nn.Module):
 
 class TCN(nn.Module):
     def __init__(self, in_ch=2, ch=192, out_ch=2, k=5, blocks=10, dropout=0.05,
-                 use_ckpt=False, use_bn=False, residual=True, separable=False, sep2d=False):
+                 use_ckpt=False, use_bn=False, residual=True):
         super().__init__()
         self.inp = nn.Conv1d(in_ch, ch, 1)
-        block_cls = TCNBlock
-        if separable and sep2d:
-            block_cls = SepTCNBlock2D
-        self.blocks = nn.ModuleList([block_cls(ch, k, dilation=2**b, dropout=dropout, use_bn=use_bn)
+        self.blocks = nn.ModuleList([TCNBlock(ch, k, dilation=2**b, dropout=dropout, use_bn=use_bn)
                                      for b in range(blocks)])
         self.out = nn.Conv1d(ch, out_ch, 1)
         self.use_ckpt = use_ckpt
         self.residual = residual
-
-
     def forward(self, x_bt2):
         from torch.utils.checkpoint import checkpoint
         x2t = x_bt2.transpose(1, 2)   # [B,2,T]
@@ -223,38 +241,6 @@ class TCN(nn.Module):
             h = checkpoint(blk, h, use_reentrant=False) if (self.use_ckpt and self.training) else blk(h)
         y = self.out(h).transpose(1, 2)  # [B,T,2]
         return (y + x_bt2 if self.residual else y), None
-
-class CausalDWConv2d(torch.nn.Conv2d):
-    # x4: [B,C,T,1]; kernel: (k,1); groups=C (depthwise)
-    def __init__(self, ch, k, dilation=1, bias=False):
-        pad = (k - 1) * dilation
-        super().__init__(ch, ch, kernel_size=(k,1),
-                         padding=(pad,0), dilation=(dilation,1),
-                         groups=ch, bias=bias)
-        self._cut = (k - 1) * dilation
-    def forward(self, x4):
-        y4 = super().forward(x4)                 # [B,C,T+pad,1]
-        return y4[:, :, :-self._cut, :] if self._cut > 0 else y4
-
-class SepTCNBlock2D(torch.nn.Module):
-    def __init__(self, ch, k, dilation, dropout=0.0, use_bn=False, gn_groups=8):
-        super().__init__()
-        self.dw1 = CausalDWConv2d(ch, k, dilation=dilation, bias=False)
-        self.pw1 = torch.nn.Conv2d(ch, ch, kernel_size=1, bias=True)
-        self.dw2 = CausalDWConv2d(ch, k, dilation=dilation, bias=False)
-        self.pw2 = torch.nn.Conv2d(ch, ch, kernel_size=1, bias=True)
-        if use_bn:
-            self.norm1 = torch.nn.BatchNorm2d(ch); self.norm2 = torch.nn.BatchNorm2d(ch)
-        else:
-            self.norm1 = torch.nn.GroupNorm(gn_groups, ch); self.norm2 = torch.nn.GroupNorm(gn_groups, ch)
-        self.dropout = torch.nn.Dropout(dropout)
-
-    def forward(self, x):                         # x: [B,C,T]
-        z = x.unsqueeze(-1).contiguous(memory_format=torch.channels_last)  # [B,C,T,1] (NHWC-friendly)
-        h = self.dw1(z); h = self.pw1(h); h = self.norm1(h); h = F.relu(h, inplace=True); h = self.dropout(h)
-        h = self.dw2(h); h = self.pw2(h); h = self.norm2(h); h = F.relu(h, inplace=True); h = self.dropout(h)
-        h = h.squeeze(-1)                         # [B,C,T]
-        return x + h
 
 # ---------------------------
 # Loss & Metrics
@@ -390,7 +376,8 @@ def make_scheduler(opt, sched, epochs, steps_per_epoch, warmup_epochs):
 
 def train_one_epoch(model, loss_fn, dl, opt, scaler, device, H, accum_steps=1, scheduler=None, ema: Optional[EMA]=None, max_steps=0):
     model.train(); start = time.time()
-    running = 0.0; steps = 0
+    running = 0.0; steps = 0; samples = 0
+    if is_ddp() and isinstance(dl.sampler, DistributedSampler): pass
     opt.zero_grad(set_to_none=True)
     for it, (x, y) in enumerate(dl):
         x, y = to_device((x, y), device)
@@ -409,9 +396,9 @@ def train_one_epoch(model, loss_fn, dl, opt, scaler, device, H, accum_steps=1, s
             if ema is not None: ema.update(model)
             steps += 1
             if max_steps > 0 and steps >= max_steps: break
-        running += float(loss.detach())
+        running += float(loss.detach()); samples += x.size(0)
     elapsed = time.time() - start
-    return running / max(1, (it + 1)), steps, elapsed
+    return running / max(1, (it + 1)), steps, samples, elapsed
 
 # ---------------------------
 # DDP init
@@ -448,8 +435,6 @@ def parse_args():
     p.add_argument("--amp", action="store_true")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--grad_ckpt", action="store_true")
-    p.add_argument("--separable", action="store_true", help="use depthwise-separable TCN blocks")
-    p.add_argument("--sep2d", action="store_true", help="use Conv2d-based depthwise blocks (fast CPU)")
     # Norm & residual
     p.add_argument("--use_bn", action="store_true", help="use BatchNorm instead of GroupNorm")
     p.add_argument("--residual", dest="residual", action=argparse.BooleanOptionalAction, default=True)
@@ -484,40 +469,12 @@ def parse_args():
     p.add_argument("--resume_all", action="store_true")
     return p.parse_args()
 
-def _save_ckpt(base_model, opt, scheduler, scaler, args, ema_obj: Optional[EMA], path: Path, extra: Dict[str, Any]):
-    ck = {
-        "model": base_model.state_dict(),
-        "opt": opt.state_dict(),
-        "sched": scheduler.state_dict(),
-        "scaler": (scaler.state_dict() if scaler is not None else {}),
-        "args": vars(args),
-        "rng_state": {
-            "torch": torch.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
-            "numpy": np.random.get_state(),
-            "python": random.getstate(),
-        },
-    }
-    if ema_obj is not None:
-        ck["ema_state"] = {k: v.detach().clone() for k, v in ema_obj.shadow.items()}
-        ck["ema_decay"] = ema_obj.decay
-        ck["eval_used_ema"] = bool(args.eval_use_ema)
-    ck.update(extra or {})
-    torch.save(ck, path)
-
-def _export_ema_model(base_model, ema_obj: EMA, path: Path):
-    # Make a pure 'model' file whose weights == EMA shadow (for inference).
-    model_sd = base_model.state_dict()
-    for n, p in ema_obj.shadow.items():
-        if n in model_sd:
-            model_sd[n] = p.detach().clone().cpu()
-    torch.save({"model": model_sd}, path)
-
 def main():
     args = parse_args()
     set_seed(args.seed); torch.backends.cudnn.benchmark = True
     local_rank = init_distributed(backend=args.backend)
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
+    if torch.cuda.is_available(): torch.cuda.setDevice = torch.cuda.set_device(device)
 
     if ddp_rank() == 0:
         only_rank0_print(f"Device: {device} | seed {args.seed} | world_size {ddp_world_size()} | rank {ddp_rank()}")
@@ -529,7 +486,7 @@ def main():
 
     # Model
     model = TCN(in_ch=2, ch=args.width, out_ch=2, k=args.kernel, blocks=args.blocks,
-                dropout=args.dropout, separable=args.separable, sep2d=args.sep2d , use_ckpt=args.grad_ckpt, use_bn=args.use_bn, residual=args.residual).to(device)
+                dropout=args.dropout, use_ckpt=args.grad_ckpt, use_bn=args.use_bn, residual=args.residual).to(device)
     if args.compile and hasattr(torch, "compile"): model = torch.compile(model)
     only_rank0_print(f"Params: {numel(model)/1e6:.2f}M | W {W_eff} H {args.H} | width {args.width} blocks {args.blocks} k {args.kernel}")
 
@@ -551,97 +508,71 @@ def main():
     # EMA
     ema = EMA(model, decay=args.ema_decay) if args.ema else None
 
-    # Resume (safe: no ckpt leakage when not resuming)
-    ckpt = None
+    # Resume
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         (model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model).load_state_dict(ckpt["model"], strict=True)
-        if ema is not None and "ema_state" in ckpt:
-            for n, p in ema.shadow.items():
-                if n in ckpt["ema_state"]:
-                    p.copy_(ckpt["ema_state"][n].to(p.device))
-            only_rank0_print("[resume] Restored EMA shadow from checkpoint.")
-        elif ema is not None:
-            only_rank0_print("[resume] No ema_state in checkpoint; will create/save it now.")
+        # If we have an EMA object and the checkpoint carries ema_state, restore it
+    if ema is not None and isinstance(ckpt, dict) and ("ema_state" in ckpt):
+        for n, p in ema.shadow.items():
+            if n in ckpt["ema_state"]:
+                p.copy_(ckpt["ema_state"][n].to(p.device))
+        only_rank0_print("[resume] Restored EMA shadow from checkpoint.")
+    elif ema is not None:
+        only_rank0_print("[resume] No ema_state in checkpoint; will create/save it now.")
 
-        if args.resume_all:
+        if args.resume_all and "opt" in ckpt and "sched" in ckpt:
             try:
-                if "opt" in ckpt: opt.load_state_dict(ckpt["opt"])
-                if "sched" in ckpt: scheduler.load_state_dict(ckpt["sched"])
+                opt.load_state_dict(ckpt["opt"]); scheduler.load_state_dict(ckpt["sched"])
                 if "scaler" in ckpt and scaler is not None: scaler.load_state_dict(ckpt["scaler"])
-                if "rng_state" in ckpt:
-                    torch.set_rng_state(ckpt["rng_state"]["torch"])
-                    if torch.cuda.is_available() and ckpt["rng_state"]["cuda"]:
-                        torch.cuda.set_rng_state_all(ckpt["rng_state"]["cuda"])
-                    np.random.set_state(ckpt["rng_state"]["numpy"])
-                    random.setstate(ckpt["rng_state"]["python"])
             except Exception as e:
-                only_rank0_print(f"[resume] Warning: could not fully load optimizer/scheduler/RNG: {e}")
+                only_rank0_print(f"[resume] Warning: could not fully load optimizer/scheduler: {e}")
 
-    best_raw = float("inf"); best_ema = float("inf")
-    out_base = Path(args.out)
-    out_raw_ckpt = out_base.with_name(f"{out_base.stem}_raw_best{out_base.suffix or '.pt'}")
-    out_ema_ckpt = out_base.with_name(f"{out_base.stem}_ema_best{out_base.suffix or '.pt'}")
-    out_ema_model = out_base.with_name(f"{out_base.stem}_ema_model{out_base.suffix or '.pt'}")
-
+    best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
         if isinstance(dl_tr.sampler, DistributedSampler): dl_tr.sampler.set_epoch(epoch)
 
-        train_loss, steps_done, sec = train_one_epoch(
+        train_loss, steps_done, samples_seen, sec = train_one_epoch(
             model, loss_fn, dl_tr, opt, scaler, device, args.H,
             accum_steps=args.accum_steps, scheduler=scheduler, ema=ema, max_steps=args.max_steps)
 
         with torch.no_grad():
-            val_raw = evaluate(model, loss_fn, dl_va, device, args.H, use_ema=None)
-            val_ema = evaluate(model, loss_fn, dl_va, device, args.H, use_ema=ema) if ema is not None else None
+            val = evaluate(model, loss_fn, dl_va, device, args.H, use_ema=(ema if args.eval_use_ema else None))
 
         if ddp_rank() == 0:
-            # Print both
-            d_raw = (val_raw['snr_out'] - val_raw['snr_in']) if (not math.isnan(val_raw['snr_in']) and not math.isnan(val_raw['snr_out'])) else float('nan')
-            print(f"Epoch {epoch:03d} | train {train_loss:.6f} | valRAW {val_raw['loss']:.6f} | "
-                  f"EVM% {val_raw['evm_pct']:.2f} ({val_raw['evm_db']:.2f} dB) | "
-                  f"SNR_in {val_raw['snr_in']:.2f} → SNR_out {val_raw['snr_out']:.2f} | Δ {d_raw:+.2f} dB | "
-                  f"cov {val_raw['ref_cov']:.1f}% | lr {scheduler.get_last_lr()[0]:.2e} | {sec/60:.02f} min")
+            delta = (val['snr_out'] - val['snr_in']) if (not math.isnan(val['snr_in']) and not math.isnan(val['snr_out'])) else float('nan')
+            print(f"Epoch {epoch:03d} | train {train_loss:.6f} | val {val['loss']:.6f} | "
+                  f"EVM% {val['evm_pct']:.2f} ({val['evm_db']:.2f} dB) | "
+                  f"SNR_in {val['snr_in']:.2f} → SNR_out {val['snr_out']:.2f} | Δ {delta:+.2f} dB | "
+                  f"cov {val['ref_cov']:.1f}% | lr {scheduler.get_last_lr()[0]:.2e} | {sec/60:.02f} min")
+            if val['loss'] < best_val:
+                best_val = val['loss']
+                base_model = (model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model)
+                to_save = {
+                    "model": base_model.state_dict(),
+                    "opt": opt.state_dict(),
+                    "sched": scheduler.state_dict(),
+                    "scaler": (scaler.state_dict() if scaler is not None else {}),
+                    "args": vars(args),
+                }
+                # NEW: persist EMA so eval/visualize can load the validated weights
+                if ema is not None:
+                    to_save["ema_state"] = {k: v.detach().clone() for k, v in ema.shadow.items()}
+                    to_save["ema_decay"] = ema.decay
+                    to_save["eval_used_ema"] = bool(args.eval_use_ema)
 
-            if val_ema is not None:
-                d_ema = (val_ema['snr_out'] - val_ema['snr_in']) if (not math.isnan(val_ema['snr_in']) and not math.isnan(val_ema['snr_out'])) else float('nan')
-                print(f"            |        | valEMA {val_ema['loss']:.6f} | "
-                      f"EVM% {val_ema['evm_pct']:.2f} ({val_ema['evm_db']:.2f} dB) | "
-                      f"SNR_in {val_ema['snr_in']:.2f} → SNR_out {val_ema['snr_out']:.2f} | Δ {d_ema:+.2f} dB | "
-                      f"cov {val_ema['ref_cov']:.1f}%")
+                torch.save(to_save, args.out)
+                print(f"  ↳ saved -> {args.out}")
 
-            base_model = (model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model)
-
-            # Save best RAW checkpoint
-            if val_raw['loss'] < best_raw:
-                best_raw = val_raw['loss']
-                _save_ckpt(base_model, opt, scheduler, scaler, args, ema, out_raw_ckpt, {"best_metric": "raw_loss", "best_value": best_raw})
-                print(f"  ↳ saved RAW best -> {out_raw_ckpt}")
-
-            # Save best EMA checkpoint + export pure EMA model
-            if val_ema is not None and val_ema['loss'] < best_ema:
-                best_ema = val_ema['loss']
-                _save_ckpt(base_model, opt, scheduler, scaler, args, ema, out_ema_ckpt, {"best_metric": "ema_loss", "best_value": best_ema})
-                _export_ema_model(base_model, ema, out_ema_model)
-                print(f"  ↳ saved EMA best -> {out_ema_ckpt}")
-                print(f"  ↳ exported EMA model (for inference) -> {out_ema_model}")
 
     with torch.no_grad():
-        te_raw = evaluate(model, loss_fn, dl_te, device, args.H, use_ema=None)
-        te_ema = evaluate(model, loss_fn, dl_te, device, args.H, use_ema=ema) if ema is not None else None
-
+        te = evaluate(model, loss_fn, dl_te, device, args.H, use_ema=(ema if args.eval_use_ema else None))
     if ddp_rank() == 0:
-        d_raw = (te_raw['snr_out'] - te_raw['snr_in']) if (not math.isnan(te_raw['snr_in']) and not math.isnan(te_raw['snr_out'])) else float('nan')
-        print("=== TEST (RAW) === "
-              f" loss {te_raw['loss']:.6f} | EVM% {te_raw['evm_pct']:.2f} ({te_raw['evm_db']:.2f} dB) "
-              f"| SNR_in {te_raw['snr_in']:.2f} → SNR_out {te_raw['snr_out']:.2f} | Δ {d_raw:+.2f} dB "
-              f"| cov {te_raw['ref_cov']:.1f}%")
-        if te_ema is not None:
-            d_ema = (te_ema['snr_out'] - te_ema['snr_in']) if (not math.isnan(te_ema['snr_in']) and not math.isnan(te_ema['snr_out'])) else float('nan')
-            print("=== TEST (EMA) === "
-                  f" loss {te_ema['loss']:.6f} | EVM% {te_ema['evm_pct']:.2f} ({te_ema['evm_db']:.2f} dB) "
-                  f"| SNR_in {te_ema['snr_in']:.2f} → SNR_out {te_ema['snr_out']:.2f} | Δ {d_ema:+.2f} dB "
-                  f"| cov {te_ema['ref_cov']:.1f}%")
+        delta = (te['snr_out'] - te['snr_in']) if (not math.isnan(te['snr_in']) and not math.isnan(te['snr_out'])) else float('nan')
+        print("=== TEST === "
+              f" loss {te['loss']:.6f} | EVM% {te['evm_pct']:.2f} ({te['evm_db']:.2f} dB) "
+              f"| SNR_in {te['snr_in']:.2f} → SNR_out {te['snr_out']:.2f} | Δ {delta:+.2f} dB "
+              f"| cov {te['ref_cov']:.1f}%")
 
     if dist.is_initialized(): dist.destroy_process_group()
 
