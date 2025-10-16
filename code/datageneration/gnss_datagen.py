@@ -144,6 +144,7 @@ def gen_split(n_items: int,
               snr_db: Optional[float],
               jammer: str,
               jsr_db: Optional[float],
+              jsr_min: Optional[float], jsr_max: Optional[float],
               jam_f0_min: float, jam_f0_max: float,
               jam_bw_min: float, jam_bw_max: float,
               jam_sweep_ms_min: float, jam_sweep_ms_max: float,
@@ -166,28 +167,32 @@ def gen_split(n_items: int,
         clean = synthesize_block(fs, block_len, prn, sps, fd, rng)
 
         observed = clean.copy()
+        # Sample per-item JSR if range provided
+        _jsr_db = jsr_db
+        if _jsr_db is None and jsr_min is not None and jsr_max is not None:
+            _jsr_db = float(rng.uniform(jsr_min, jsr_max))
 
         jm = {"type": "none"}
-        if jammer != "none" and jsr_db is not None:
+        if jammer != "none" and (_jsr_db is not None):
             if jammer == "tone":
                 f0 = float(rng.uniform(jam_f0_min, jam_f0_max))
                 jam = tone_jammer(fs, block_len, f0, rng)
-                observed = mix_jammer(observed, jam, jsr_db)
-                jm = {"type": "tone", "f0_hz": f0, "jsr_db": jsr_db}
+                observed = mix_jammer(observed, jam, _jsr_db)
+                jm = {"type": "tone", "f0_hz": f0, "jsr_db": _jsr_db}
             elif jammer == "swept_cw":
                 f0 = float(rng.uniform(jam_f0_min, jam_f0_max))
                 bw = float(rng.uniform(jam_bw_min, jam_bw_max))
                 sw_ms = float(rng.uniform(jam_sweep_ms_min, jam_sweep_ms_max))
                 jam = swept_cw_jammer(fs, block_len, f0, bw, sw_ms, rng)
-                observed = mix_jammer(observed, jam, jsr_db)
-                jm = {"type": "swept_cw", "f_center_hz": f0, "bw_hz": bw, "sweep_ms": sw_ms, "jsr_db": jsr_db}
+                observed = mix_jammer(observed, jam, _jsr_db)
+                jm = {"type": "swept_cw", "f_center_hz": f0, "bw_hz": bw, "sweep_ms": sw_ms, "jsr_db": _jsr_db}
             elif jammer == "pulsed":
                 f0 = float(rng.uniform(jam_f0_min, jam_f0_max))
                 duty = float(rng.uniform(jam_duty_min, jam_duty_max))
                 per_ms = float(rng.uniform(jam_period_ms_min, jam_period_ms_max))
                 jam = pulsed_tone_jammer(fs, block_len, f0, duty, per_ms, rng)
-                observed = mix_jammer(observed, jam, jsr_db)
-                jm = {"type": "pulsed", "f0_hz": f0, "duty": duty, "period_ms": per_ms, "jsr_db": jsr_db}
+                observed = mix_jammer(observed, jam, _jsr_db)
+                jm = {"type": "pulsed", "f0_hz": f0, "duty": duty, "period_ms": per_ms, "jsr_db": _jsr_db}
             else:
                 raise ValueError(f"Unknown jammer: {jammer}")
 
@@ -215,7 +220,7 @@ def gen_split(n_items: int,
         "dopplers": dopplers,
         "snr_db": snr_db,
         "jammer": jammer,
-        "jsr_db": jsr_db,
+        "jsr_db": _jsr_db,
         "jam_meta": jam_meta,
         "notes": "Ideal GPS L1 C/A. Jammer added to X only when enabled. Y is clean.",
     }
@@ -236,6 +241,8 @@ def main():
     # Jammer args
     ap.add_argument("--jammer", type=str, default="none", choices=["none", "tone", "swept_cw", "pulsed"])
     ap.add_argument("--jsr-db", type=float, default=None, help="Jam-to-signal power ratio in dB (applied to X).")
+    ap.add_argument("--jsr-min", type=float, default=None, help="If set with --jsr-max, sample JSR per item in [min,max] dB")
+    ap.add_argument("--jsr-max", type=float, default=None, help="Upper bound (dB) for per-item JSR sampling")
     ap.add_argument("--jam-f0-min", type=float, default=-6.0e5, help="Min jammer center freq (Hz) relative to baseband.")
     ap.add_argument("--jam-f0-max", type=float, default=+6.0e5, help="Max jammer center freq (Hz).")
     ap.add_argument("--jam-bw-min", type=float, default=2.0e5, help="Min sweep BW for swept_cw (Hz).")
@@ -259,7 +266,7 @@ def main():
 
     Xtr, Ytr, meta_tr = gen_split(args.n_train, fs, block_len, args.prn_low, args.prn_high,
                                   args.doppler_max_hz, args.snr_db,
-                                  args.jammer, args.jsr_db,
+                                  args.jammer, args.jsr_db, args.jsr_min, args.jsr_max,
                                   args.jam_f0_min, args.jam_f0_max,
                                   args.jam_bw_min, args.jam_bw_max,
                                   args.jam_sweep_ms_min, args.jam_sweep_ms_max,
@@ -269,7 +276,7 @@ def main():
 
     Xva, Yva, meta_va = gen_split(args.n_val, fs, block_len, args.prn_low, args.prn_high,
                                   args.doppler_max_hz, args.snr_db,
-                                  args.jammer, args.jsr_db,
+                                  args.jammer, args.jsr_db, args.jsr_min, args.jsr_max,
                                   args.jam_f0_min, args.jam_f0_max,
                                   args.jam_bw_min, args.jam_bw_max,
                                   args.jam_sweep_ms_min, args.jam_sweep_ms_max,
@@ -279,7 +286,7 @@ def main():
 
     Xte, Yte, meta_te = gen_split(args.n_test, fs, block_len, args.prn_low, args.prn_high,
                                   args.doppler_max_hz, args.snr_db,
-                                  args.jammer, args.jsr_db,
+                                  args.jammer, args.jsr_db, args.jsr_min, args.jsr_max,
                                   args.jam_f0_min, args.jam_f0_max,
                                   args.jam_bw_min, args.jam_bw_max,
                                   args.jam_sweep_ms_min, args.jam_sweep_ms_max,
@@ -308,17 +315,21 @@ def main():
         "meta_te": {k: v for k, v in meta_te.items() if k not in ("prns_used", "jam_meta")},
     }
 
+    
     np.savez_compressed(args.out,
                         Xtr=Xtr, Ytr=Ytr,
                         Xva=Xva, Yva=Yva,
                         Xte=Xte, Yte=Yte,
                         meta=json.dumps(meta))
     print(f"[done] saved -> {args.out}")
-    print(f"shapes: train {Xtr.shape}, val {Xva.shape}, test {Xte.shape} | fs={fs/1e6:.3f} Msps | block={args.block_ms:.3f} ms | sps={int(round(fs/CHIP_RATE))}")
+    print(f"shapes: train {Xtr.shape}, val {Xva.shape}, test {Xte.shape} | block={args.block_ms:.3f} ms | sps={int(round(fs/CHIP_RATE))}")
     if args.jammer == "none":
         print("No jammer.")
     else:
-        print(f"Jammer: {args.jammer} | JSR={args.jsr_db} dB")
+        if args.jsr_db is None and (args.jsr_min is not None and args.jsr_max is not None):
+            print(f"Jammer: {args.jammer} | JSR∈[{args.jsr_min},{args.jsr_max}] dB")
+        else:
+            print(f"Jammer: {args.jammer} | JSR={args.jsr_db} dB")
     if args.snr_db is None:
         print("No AWGN: X = Y (if no jammer).")
     else:

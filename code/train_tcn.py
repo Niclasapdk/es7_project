@@ -1,580 +1,523 @@
 #!/usr/bin/env python3
-# train_tcn.py — DDP-ready Causal TCN denoiser with robust EVM/SNR + hardened loader
+"""
+train_tcn.py — Causal TCN denoiser for GNSS L1 (pre‑correlation), with optional DSP prefilter
+Features
+- Causal TCN (dilated residual blocks)
+- Optional DSP assist: frequency‑domain soft gate ("stft_gate") or single‑bin Gaussian notch ("notch")
+- Input modes: raw | dsp | dualpath  (2‑ch raw IQ, 2‑ch DSP IQ, or 4‑ch concat)
+- Band‑aware spectral loss (in‑band/guard/out‑of‑band weights)
+- DDP (torchrun) + AMP support; metrics reduced across ranks; only rank 0 saves
+"""
 
-import os, math, argparse, time, random
+import os, time, argparse, math
 from pathlib import Path
-from typing import Optional, Iterable, Dict, Any, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from torch.amp import autocast, GradScaler
+import torch.distributed as dist
+
+# ---------------------------
+# DDP helpers
+# ---------------------------
+
+def ddp_env():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    return world_size, rank, local_rank
+
+def ddp_init_if_needed(backend="nccl"):
+    world_size, rank, local_rank = ddp_env()
+    if world_size > 1 and not dist.is_initialized():
+        dist.init_process_group(backend=backend, init_method="env://")
+    return world_size, rank, local_rank
+
+def ddp_barrier():
+    if dist.is_initialized():
+        dist.barrier()
+
+def ddp_all_reduce_tensor(t: torch.Tensor, op=dist.ReduceOp.SUM):
+    if dist.is_initialized():
+        dist.all_reduce(t, op=op)
+    return t
 
 # ---------------------------
 # Utilities
 # ---------------------------
 
-def set_seed(seed: int = 1337):
-    random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+def complex_from_iq(x: torch.Tensor) -> torch.Tensor:
+    """x: [..., 2] float32 -> complex64"""
+    return torch.view_as_complex(x.to(torch.float32))
 
-def to_device(batch, device): return tuple(t.to(device, non_blocking=True) for t in batch)
+def iq_from_complex(z: torch.Tensor) -> torch.Tensor:
+    """z: complex64 -> [..., 2] float32"""
+    return torch.view_as_real(z).to(torch.float32)
 
-def numel(model: nn.Module) -> int: return sum(p.numel() for p in model.parameters())
-
-def is_ddp() -> bool: return dist.is_available() and dist.is_initialized()
-def ddp_rank() -> int: return dist.get_rank() if is_ddp() else 0
-def ddp_world_size() -> int: return dist.get_world_size() if is_ddp() else 1
-def only_rank0_print(*args, **kwargs):
-    if ddp_rank() == 0: print(*args, **kwargs, flush=True)
-
-def all_reduce_sum_(t: torch.Tensor) -> torch.Tensor:
-    if is_ddp(): dist.all_reduce(t, op=dist.ReduceOp.SUM)
-    return t
+def center_and_rms_norm(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """DC removal + unit RMS per example (per-block). x: [B,T,2]"""
+    x = x - x.mean(dim=1, keepdim=True)
+    rms = torch.sqrt((x.pow(2).sum(dim=-1).mean(dim=1, keepdim=True)) + eps)  # [B,1]
+    return x / rms.unsqueeze(-1)
 
 # ---------------------------
 # Data
 # ---------------------------
 
+def _canonicalize_bt2(a: np.ndarray) -> np.ndarray:
+    a = np.asarray(a)
+    if a.ndim == 2 and a.shape[1] == 2:
+        a = a[None, ...]
+    if not (a.ndim == 3 and a.shape[-1] == 2):
+        raise ValueError(f"Expected [N,T,2] but got {a.shape}")
+    return a.astype(np.float32, copy=False)
+
+def _find_sets(npz: Dict[str, np.ndarray]):
+    keys = set(npz.keys())
+    if {"Xtr","Ytr","Xva","Yva"}.issubset(keys):
+        Xtr,Ytr,Xva,Yva = npz["Xtr"],npz["Ytr"],npz["Xva"],npz["Yva"]
+        nmid = max(1, Xva.shape[0]//2)
+        return {"train":(Xtr,Ytr), "val":(Xva[:nmid],Yva[:nmid]), "test":(Xva[nmid:],Yva[nmid:])}
+    if {"X","Y"}.issubset(keys):
+        X,Y = npz["X"],npz["Y"]; N=X.shape[0]
+        ntr, nva = int(0.8*N), int(0.1*N)
+        return {"train":(X[:ntr],Y[:ntr]), "val":(X[ntr:ntr+nva],Y[ntr:ntr+nva]), "test":(X[ntr+nva:],Y[ntr+nva:])}
+    raise ValueError(f"Could not infer dataset keys from: {sorted(keys)}")
+
 class IQWindows(Dataset):
-    """Sliding windows [W] over sequences [N, T, 2]."""
     def __init__(self, X: np.ndarray, Y: np.ndarray, W: int, H: int):
-        # Hardened: coerce to contiguous float32 tensors here too
-        if not (X.ndim == 3 and Y.ndim == 3 and X.shape[-1] == 2 and Y.shape[-1] == 2):
-            raise ValueError(f"IQWindows expects [N,T,2] but got X {X.shape}, Y {Y.shape}")
-        if X.shape != Y.shape:
-            raise ValueError(f"X and Y must match exactly, got {X.shape} vs {Y.shape}")
-
+        self.X = _canonicalize_bt2(X); self.Y = _canonicalize_bt2(Y)
+        if self.X.shape != self.Y.shape: raise ValueError("X and Y shapes must match.")
         self.W = int(W); self.H = int(H)
-        N, T, C = X.shape; self.T = T
-        self.src = X.astype(np.float32, copy=False)
-        self.tgt = Y.astype(np.float32, copy=False)
-
+        N,T,_ = self.X.shape; self.T=T
         self.index = []
-        if T == W:
-            self.index = [(i, 0) for i in range(N)]
+        if T == self.W:
+            self.index = [(i,0) for i in range(N)]
         else:
             for i in range(N):
-                for s in range(0, T - W + 1, self.H):
-                    self.index.append((i, s))
+                for s in range(0, T - self.W + 1, self.H):
+                    self.index.append((i,s))
 
     def __len__(self): return len(self.index)
 
-    def __getitem__(self, i):
-        n, s = self.index[i]; e = s + self.W
-        x = self.src[n, s:e, :]    # [W,2]
-        y = self.tgt[n, s:e, :]
+    def __getitem__(self, i: int):
+        n,s = self.index[i]; e=s+self.W
+        x = self.X[n, s:e, :]; y = self.Y[n, s:e, :]
         return torch.from_numpy(x), torch.from_numpy(y)
 
-def _canonicalize_bt2(a: np.ndarray) -> np.ndarray:
-    """
-    Convert many RF dataset shapes into [N,T,2] float32.
-    Handles complex, [N,2,T], [T,2], [T], [N,T], etc.
-    """
-    a = np.asarray(a)
-    if np.iscomplexobj(a):
-        a = np.stack([a.real, a.imag], axis=-1)  # (..., 2)
+def load_npz_dataset(path: str, W: int, H: int, batch: int, workers: int, *, world_size:int=1, rank:int=0):
+    npz = np.load(path, allow_pickle=False)
+    sets = _find_sets(npz)
+    Xtr,Ytr = sets["train"]; Xva,Yva = sets["val"]; Xte,Yte = sets["test"]
 
-    if a.ndim == 3 and a.shape[-1] == 2:
-        # [N,T,2] or [?, ?, 2]; assume batch-first if size-1 is plausible
-        pass
-    elif a.ndim == 3 and a.shape[1] == 2:  # [N,2,T] -> [N,T,2]
-        a = np.transpose(a, (0, 2, 1))
-    elif a.ndim == 2 and a.shape[-1] == 2:  # [T,2] -> [1,T,2]
-        a = a[None, ...]
-    elif a.ndim == 2:  # [N,T] real -> add imag=0 -> [N,T,2]
-        a = np.stack([a, np.zeros_like(a)], axis=-1)
-    elif a.ndim == 1:  # [T] -> [1,T,2] with imag=0
-        a = np.stack([a, np.zeros_like(a)], axis=-1)[None, ...]
-    else:
-        raise ValueError(f"Cannot canonicalize array of shape {a.shape} to [N,T,2]")
-
-    # If last dim somehow not 2, try to coerce
-    if a.shape[-1] != 2:
-        if a.shape[-1] == 1:
-            a = np.concatenate([a, np.zeros_like(a)], axis=-1)
-        else:
-            raise ValueError(f"Last dimension must be 2 after canonicalization, got {a.shape}")
-    return a.astype(np.float32, copy=False)
-
-def _align_xy(X: np.ndarray, Y: np.ndarray, label: str) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    If X and Y differ slightly in N or T, slice to common min dimensions.
-    Logs what was changed (rank0).
-    """
-    if X.shape == Y.shape: return X, Y
-    Nx, Tx, _ = X.shape; Ny, Ty, _ = Y.shape
-    N = min(Nx, Ny); T = min(Tx, Ty)
-    if ddp_rank() == 0:
-        only_rank0_print(f"[data:{label}] Mismatch X {X.shape} vs Y {Y.shape} -> slicing to (N={N}, T={T})")
-    return X[:N, :T, :], Y[:N, :T, :]
-
-def _find_npz_keys(npz):
-    keys = set(npz.files)
-    # Most common patterns
-    triplets = [
-        ("X_train","Y_train","X_val","Y_val","X_test","Y_test"),
-        ("train_X","train_Y","val_X","val_Y","test_X","test_Y"),
-        ("Xtr","Ytr","Xva","Yva","Xte","Yte"),
-        ("X_tr","Y_tr","X_va","Y_va","X_te","Y_te"),
-    ]
-    for (xtr,ytr,xva,yva,xte,yte) in triplets:
-        if {xtr,ytr,xva,yva,xte,yte}.issubset(keys):
-            return {"train": (npz[xtr], npz[ytr]), "val": (npz[xva], npz[yva]), "test": (npz[xte], npz[yte])}
-
-    # Train/val only — split val into val/test
-    pairs_no_test = [
-        ("Xtr","Ytr","Xva","Yva"), ("X_tr","Y_tr","X_va","Y_va"),
-        ("X_train","Y_train","X_val","Y_val"), ("train_X","train_Y","val_X","val_Y"),
-    ]
-    for (xtr,ytr,xva,yva) in pairs_no_test:
-        if {xtr,ytr,xva,yva}.issubset(keys):
-            Xtr, Ytr = npz[xtr], npz[ytr]
-            Xva, Yva = npz[xva], npz[yva]
-            mid = max(1, Xva.shape[0] // 2)
-            return {"train": (Xtr, Ytr), "val": (Xva[:mid], Yva[:mid]), "test": (Xva[mid:], Yva[mid:])}
-
-    # Single pair X/Y — make an 80/10/10 split
-    if "X" in keys and "Y" in keys:
-        X, Y = npz["X"], npz["Y"]; N = X.shape[0]
-        ntr, nva = int(0.8*N), int(0.1*N)
-        return {"train": (X[:ntr],Y[:ntr]), "val": (X[ntr:ntr+nva],Y[ntr:ntr+nva]), "test": (X[ntr+nva:],Y[ntr+nva:])}
-
-    raise ValueError(f"Could not infer dataset keys from npz keys={sorted(keys)}")
-
-def load_npz_dataset(path: str, W: int, H: int, batch: int, workers: int, prefetch: int):
-    path = str(path); npz = np.load(path, allow_pickle=False)
-    sets = _find_npz_keys(npz)
-
-    # Canonicalize to [N,T,2]
-    Xtr, Ytr = _canonicalize_bt2(sets["train"][0]), _canonicalize_bt2(sets["train"][1])
-    Xva, Yva = _canonicalize_bt2(sets["val"][0]),   _canonicalize_bt2(sets["val"][1])
-    Xte, Yte = _canonicalize_bt2(sets["test"][0]),  _canonicalize_bt2(sets["test"][1])
-
-    # Align if off-by-one or similar mismatches exist
-    Xtr, Ytr = _align_xy(Xtr, Ytr, "train")
-    Xva, Yva = _align_xy(Xva, Yva, "val")
-    Xte, Yte = _align_xy(Xte, Yte, "test")
-
-    # Effective window
     T_min = min(Xtr.shape[1], Xva.shape[1], Xte.shape[1])
     W_eff = min(int(W), int(T_min))
-    if W_eff < W: only_rank0_print(f"[data] Requested W={W} exceeds dataset min T={T_min}. Clamping W -> {W_eff}.")
+    if W_eff < W:
+        print(f"[data] Requested W={W} exceeds dataset min T={T_min}. Clamping W -> {W_eff}.")
 
-    # Datasets
     ds_tr = IQWindows(Xtr, Ytr, W_eff, H)
-    ds_va = IQWindows(Xva, Yva, W_eff, H)
-    ds_te = IQWindows(Xte, Yte, W_eff, H)
+    ds_va = IQWindows(Xva, Yva, W_eff, W_eff)
 
-    only_rank0_print(f"[data] shapes: train {Xtr.shape}, val {Xva.shape}, test {Xte.shape} | W={W_eff} H={H}")
+    if world_size > 1:
+        from torch.utils.data.distributed import DistributedSampler
+        sampler_tr = DistributedSampler(ds_tr, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
+        sampler_va = DistributedSampler(ds_va, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+    else:
+        sampler_tr = None; sampler_va = None
 
-    sampler_tr = DistributedSampler(ds_tr, shuffle=True) if ddp_world_size() > 1 else None
-    sampler_va = DistributedSampler(ds_va, shuffle=False) if ddp_world_size() > 1 else None
-    sampler_te = DistributedSampler(ds_te, shuffle=False) if ddp_world_size() > 1 else None
+    dl_tr = DataLoader(ds_tr, batch_size=batch, shuffle=(sampler_tr is None),
+                       sampler=sampler_tr, num_workers=workers, pin_memory=True,
+                       drop_last=True, persistent_workers=(workers>0), prefetch_factor=4)
+    dl_va = DataLoader(ds_va, batch_size=batch, shuffle=False,
+                       sampler=sampler_va, num_workers=workers, pin_memory=True,
+                       drop_last=False, persistent_workers=(workers>0), prefetch_factor=4)
 
-    # prefetch_factor is only valid if num_workers > 0
-    dl_kwargs = dict(pin_memory=True, persistent_workers=(workers > 0), num_workers=workers)
-    if workers > 0:
-        dl_kwargs["prefetch_factor"] = prefetch
-
-    dl_tr = DataLoader(
-        ds_tr, batch_size=batch, sampler=sampler_tr,
-        shuffle=(sampler_tr is None), drop_last=True, **dl_kwargs
-    )
-    dl_va = DataLoader(
-        ds_va, batch_size=batch, sampler=sampler_va,
-        shuffle=False, drop_last=False, **dl_kwargs
-    )
-    dl_te = DataLoader(
-        ds_te, batch_size=batch, sampler=sampler_te,
-        shuffle=False, drop_last=False, **dl_kwargs
-    )
-    return ds_tr, ds_va, ds_te, dl_tr, dl_va, dl_te, W_eff
+    return ds_tr, ds_va, dl_tr, dl_va, W_eff
 
 # ---------------------------
-# Model
+# Prefilter (frequency-domain, per-window)
+# ---------------------------
+
+def _freq_bins(n: int, fs: float, device) -> torch.Tensor:
+    return torch.linspace(0.0, fs/2.0, n//2 + 1, device=device)
+
+def _band_weights(freqs: torch.Tensor, inband_hz: float, guard_hz: float, w_in: float, w_guard: float, w_out: float):
+    w = torch.full_like(freqs, w_out)
+    w = torch.where(freqs <= guard_hz, torch.full_like(freqs, w_guard), w)
+    w = torch.where(freqs <= inband_hz, torch.full_like(freqs, w_in), w)
+    return w
+
+def stft_gate_prefilter(x: torch.Tensor, fs: float, inband_hz: float, guard_hz: float,
+                        max_depth_in: float, max_depth_out: float, gate_k: float = 3.0) -> torch.Tensor:
+    B,T = x.shape
+    X = torch.fft.rfft(x, n=T, dim=1)  # [B, F]
+    mag = X.abs()
+    floor = torch.median(mag, dim=1, keepdim=True).values.clamp_min(1e-12)
+    ratio = (mag / floor)
+    excess = torch.clamp(ratio - gate_k, min=0.0)
+
+    freqs = _freq_bins(T, fs, x.device)[None, :]
+    Lin = 10.0 ** (-max_depth_in / 20.0)
+    Lout = 10.0 ** (-max_depth_out / 20.0)
+
+    in_mask   = (freqs <= inband_hz).to(x.dtype)
+    att_in  = (1.0 - (1.0 - Lin)  * torch.tanh(excess / (gate_k*2.0)))
+    att_out = (1.0 - (1.0 - Lout) * torch.tanh(excess / (gate_k*2.0)))
+    att = att_in * in_mask + att_out * (1 - in_mask)
+
+    Xf = X * att
+    xf = torch.fft.irfft(Xf, n=T, dim=1)
+    return xf
+
+def notch_prefilter(x: torch.Tensor, fs: float, inband_hz: float, guard_hz: float,
+                    max_depth_in: float, max_depth_out: float, q: float = 600.0) -> torch.Tensor:
+    B,T = x.shape
+    X = torch.fft.rfft(x, n=T, dim=1)
+    mag = X.abs()
+    peak_bin = torch.argmax(mag[:,1:], dim=1) + 1
+    freqs = _freq_bins(T, fs, x.device)
+
+    peak_freq = freqs[peak_bin]
+    cap_db = torch.where(peak_freq <= guard_hz,
+                         torch.where(peak_freq <= inband_hz,
+                                     torch.full_like(peak_freq, max_depth_in),
+                                     torch.full_like(peak_freq, max_depth_out)),
+                         torch.full_like(peak_freq, max_depth_out))
+    cap = 10.0 ** (-cap_db / 20.0)
+
+    df = (fs/2.0) / (T//2)
+    f0 = peak_freq.clamp_min(1.0)
+    sigma_bins = (f0 / (q * df)).clamp_min(1.5)
+
+    F = X.shape[1]
+    idx = torch.arange(F, device=x.device)[None, :].repeat(B,1)
+    pb = peak_bin[:,None].to(torch.float32)
+    sb = sigma_bins[:,None]
+    gauss = torch.exp(-0.5 * ((idx - pb)/sb)**2)
+    att = 1.0 - (1.0 - cap[:,None]) * gauss
+
+    Xf = X * att
+    xf = torch.fft.irfft(Xf, n=T, dim=1)
+    return xf
+
+def apply_prefilter(x_btc2: torch.Tensor, fs: float, mode: str, inband_hz: float, guard_hz: float,
+                    max_depth_in: float, max_depth_out: float) -> torch.Tensor:
+    xc = complex_from_iq(x_btc2)
+    xc = complex_from_iq(center_and_rms_norm(iq_from_complex(xc)))
+    if mode == "none":
+        return iq_from_complex(xc)
+    elif mode == "stft_gate":
+        xf = stft_gate_prefilter(xc, fs, inband_hz, guard_hz, max_depth_in, max_depth_out)
+        return iq_from_complex(xf)
+    elif mode == "notch":
+        xf = notch_prefilter(xc, fs, inband_hz, guard_hz, max_depth_in, max_depth_out)
+        return iq_from_complex(xf)
+    else:
+        raise ValueError(f"Unknown prefilter mode: {mode}")
+
+# ---------------------------
+# Model (Causal TCN)
 # ---------------------------
 
 class CausalConv1d(nn.Conv1d):
-    def __init__(self, in_ch, out_ch, kernel_size, dilation=1):
-        pad = (kernel_size - 1) * dilation
-        super().__init__(in_ch, out_ch, kernel_size, padding=pad, dilation=dilation)
+    def __init__(self, in_ch, out_ch, kernel_size, dilation):
+        padding = (kernel_size - 1) * dilation
+        super().__init__(in_ch, out_ch, kernel_size, padding=padding, dilation=dilation)
+        self.remove = padding
     def forward(self, x):
         out = super().forward(x)
-        cut = (self.kernel_size[0] - 1) * self.dilation[0]
-        return out[..., :-cut] if cut > 0 else out
+        if self.remove > 0:
+            out = out[..., :-self.remove]
+        return out
 
-class TCNBlock(nn.Module):
-    def __init__(self, ch, k, dilation, dropout=0.0, use_bn=False, gn_groups=8):
+class ResidualBlock(nn.Module):
+    def __init__(self, ch, k, d, gn_groups=8, dropout=0.0):
         super().__init__()
-        self.conv1 = CausalConv1d(ch, ch, k, dilation=dilation)
-        self.conv2 = CausalConv1d(ch, ch, k, dilation=dilation)
-        if use_bn:
-            self.norm1 = nn.BatchNorm1d(ch); self.norm2 = nn.BatchNorm1d(ch)
-        else:
-            self.norm1 = nn.GroupNorm(gn_groups, ch); self.norm2 = nn.GroupNorm(gn_groups, ch)
-        self.dropout = nn.Dropout(dropout)
+        self.conv1 = CausalConv1d(ch, ch, k, d)
+        self.gn1 = nn.GroupNorm(num_groups=min(gn_groups, ch), num_channels=ch)
+        self.conv2 = CausalConv1d(ch, ch, k, d)
+        self.gn2 = nn.GroupNorm(num_groups=min(gn_groups, ch), num_channels=ch)
+        self.drop = nn.Dropout(dropout)
+
     def forward(self, x):
-        h = self.conv1(x); h = self.norm1(h); h = F.relu(h, inplace=True); h = self.dropout(h)
-        h = self.conv2(h); h = self.norm2(h); h = F.relu(h, inplace=True); h = self.dropout(h)
-        return x + h
+        y = self.conv1(x)
+        y = F.relu(self.gn1(y))
+        y = self.drop(y)
+        y = self.conv2(y)
+        y = self.gn2(y)
+        return F.relu(x + y)
 
 class TCN(nn.Module):
-    def __init__(self, in_ch=2, ch=192, out_ch=2, k=5, blocks=10, dropout=0.05,
-                 use_ckpt=False, use_bn=False, residual=True):
+    def __init__(self, in_ch: int, ch: int = 160, k: int = 7, n_blocks: int = 10, out_ch: int = 2):
         super().__init__()
-        self.inp = nn.Conv1d(in_ch, ch, 1)
-        self.blocks = nn.ModuleList([TCNBlock(ch, k, dilation=2**b, dropout=dropout, use_bn=use_bn)
-                                     for b in range(blocks)])
+        self.inp = CausalConv1d(in_ch, ch, 1, 1)
+        blocks = []
+        for i in range(n_blocks):
+            d = 2 ** i
+            blocks.append(ResidualBlock(ch, k, d))
+        self.blocks = nn.Sequential(*blocks)
         self.out = nn.Conv1d(ch, out_ch, 1)
-        self.use_ckpt = use_ckpt
-        self.residual = residual
-    def forward(self, x_bt2):
-        from torch.utils.checkpoint import checkpoint
-        x2t = x_bt2.transpose(1, 2)   # [B,2,T]
-        h = self.inp(x2t)
-        for blk in self.blocks:
-            h = checkpoint(blk, h, use_reentrant=False) if (self.use_ckpt and self.training) else blk(h)
-        y = self.out(h).transpose(1, 2)  # [B,T,2]
-        return (y + x_bt2 if self.residual else y), None
+    def forward(self, x_btc):
+        x = x_btc.permute(0,2,1)
+        h = self.inp(x)
+        h = self.blocks(h)
+        y = self.out(h)
+        y = y.permute(0,2,1)
+        return y
 
 # ---------------------------
 # Loss & Metrics
 # ---------------------------
 
-def pairwise_diff(x):  # [B,T,2]
-    d = x[:, 1:, :] - x[:, :-1, :]
-    return F.pad(d, (0,0,1,0))
+def evm_pct_and_db(y_true: torch.Tensor, y_pred: torch.Tensor, eps: float = 1e-12):
+    yt = complex_from_iq(y_true); yp = complex_from_iq(y_pred)
+    num = torch.sum(torch.conj(yp) * yt, dim=1, keepdim=True)
+    den = torch.sum(torch.conj(yp) * yp, dim=1, keepdim=True).clamp_min(eps)
+    alpha = num / den
+    err = alpha * yp - yt
+    evm = torch.sqrt(torch.sum(torch.abs(err)**2, dim=1) / torch.sum(torch.abs(yt)**2, dim=1).clamp_min(eps))
+    evm_pct = evm * 100.0
+    evm_db = 20.0 * torch.log10(evm.clamp_min(eps))
+    return evm_pct.mean(), evm_db.mean()
 
-class MaskedTimeLoss(nn.Module):
-    def __init__(self, alpha=0.05, beta_evm_norm=0.02, spec_weight=0.01, eps=1e-12):
+def snr_db(y_true: torch.Tensor, y_pred: torch.Tensor, x_in: torch.Tensor, eps: float = 1e-12):
+    yt = complex_from_iq(y_true); yp = complex_from_iq(y_pred); xx = complex_from_iq(x_in)
+    n_in = torch.sum(torch.abs(xx - yt)**2, dim=1)
+    s   = torch.sum(torch.abs(yt)**2, dim=1).clamp_min(eps)
+    snr_in = 10.0 * torch.log10((s / n_in.clamp_min(eps)).clamp_min(eps))
+    n_out = torch.sum(torch.abs(yp - yt)**2, dim=1)
+    snr_out = 10.0 * torch.log10((s / n_out.clamp_min(eps)).clamp_min(eps))
+    return snr_in.mean(), snr_out.mean()
+
+def spectral_loss(y_true: torch.Tensor, y_pred: torch.Tensor, fs: float, inband_hz: float, guard_hz: float,
+                  w_in: float, w_guard: float, w_out: float, eps: float = 1e-9) -> torch.Tensor:
+    yt = complex_from_iq(y_true); yp = complex_from_iq(y_pred)
+    B,T = yt.shape
+    YT = torch.fft.rfft(yt, n=T, dim=1)
+    YP = torch.fft.rfft(yp, n=T, dim=1)
+    freqs = _freq_bins(T, fs, yt.device)[None, :]
+    W = _band_weights(freqs, inband_hz, guard_hz, w_in, w_guard, w_out)
+    diff = (YP.abs() - YT.abs())
+    return torch.mean(W * (diff ** 2))
+
+def first_diff_loss(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+    yt = y_true[:,1:,:] - y_true[:,:-1,:]
+    yp = y_pred[:,1:,:] - y_pred[:,:-1,:]
+    return F.l1_loss(yp, yt)
+
+class CompositeLoss(nn.Module):
+    def __init__(self, fs: float, inband_hz: float, guard_hz: float,
+                 spec_weight: float, w_in: float, w_guard: float, w_out: float,
+                 smooth_weight: float, evm_norm_weight: float):
         super().__init__()
-        self.alpha = alpha; self.beta = beta_evm_norm; self.spec_w = spec_weight; self.eps = eps
-    def forward(self, yhat, y, H):
-        m = (y.pow(2).sum(dim=-1, keepdim=True) > self.eps).float()
-        denom = m.sum() * y.size(-1) + 1e-12
-        base = ((yhat - y).abs() * m).sum() / denom
-        delta = ((pairwise_diff(yhat) - pairwise_diff(y)).abs() * m).sum() / denom
-        num = ((yhat - y) * m).pow(2).sum(dim=(-1, -2))
-        den = (y * m).pow(2).sum(dim=(-1, -2)).clamp_min(self.eps)
-        evm_norm = (num / den).mean()
-        yh_c = torch.complex((yhat*m)[...,0], (yhat*m)[...,1]); y_c = torch.complex((y*m)[...,0], (y*m)[...,1])
-        spec = (torch.fft.fft(yh_c, dim=1).abs() - torch.fft.fft(y_c, dim=1).abs()).abs().mean()
-        return base + self.alpha*delta + self.beta*evm_norm + self.spec_w*spec
+        self.fs=fs; self.inband=inband_hz; self.guard=guard_hz
+        self.spec_weight=spec_weight; self.w_in=w_in; self.w_guard=w_guard; self.w_out=w_out
+        self.smooth_weight=smooth_weight; self.evm_norm_weight=evm_norm_weight
 
-@torch.no_grad()
-def evaluate(model, loss_fn, dl, device, H, eps=1e-12, use_ema=None):
-    model_eval = model
-    if use_ema is not None: use_ema.apply(model_eval)
-    model_eval.eval()
+        
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        l_time = F.l1_loss(y_pred, y_true)
+        l_spec = spectral_loss(y_true, y_pred, self.fs, self.inband, self.guard, self.w_in, self.w_guard, self.w_out)
+        l_smooth = first_diff_loss(y_true, y_pred)
+        evm_pct, _ = evm_pct_and_db(y_true, y_pred); evm_norm = (evm_pct / 100.0)
+        return l_time + self.spec_weight*l_spec + self.smooth_weight*l_smooth + self.evm_norm_weight*evm_norm
 
-    tot_loss = torch.zeros((), dtype=torch.float64, device=device)
-    n_loss   = torch.zeros((), dtype=torch.float64, device=device)
-    err_pow  = torch.zeros((), dtype=torch.float64, device=device)
-    ref_pow  = torch.zeros((), dtype=torch.float64, device=device)
-    sig_pow  = torch.zeros((), dtype=torch.float64, device=device)
-    nse_in   = torch.zeros((), dtype=torch.float64, device=device)
-    nse_out  = torch.zeros((), dtype=torch.float64, device=device)
-    kept_s   = torch.zeros((), dtype=torch.float64, device=device)
-    total_s  = torch.zeros((), dtype=torch.float64, device=device)
+# ---------------------------
+# Train / Eval
+# ---------------------------
 
-    for x, y in dl:
-        x, y = to_device((x, y), device)
-        with autocast("cuda", enabled=False):
-            yhat, _ = model_eval(x)
-        loss = loss_fn(yhat, y, H)
-        bs = x.size(0); tot_loss += loss.detach() * bs; n_loss += bs
-        m = (y.pow(2).sum(dim=-1, keepdim=True) > eps).float()
-        valid = (m.sum(dim=(1, 2)) > 0)
-        if valid.any():
-            m = m[valid]; yt = y[valid]*m; yh = yhat[valid]*m; xx = x[valid]*m
-            err_pow += (yh - yt).pow(2).sum(dtype=torch.float64)
-            ref_pow += yt.pow(2).sum(dtype=torch.float64)
-            sig_pow += yt.pow(2).sum(dtype=torch.float64)
-            nse_in  += (xx - yt).pow(2).sum(dtype=torch.float64)
-            nse_out += (yh - yt).pow(2).sum(dtype=torch.float64)
-            kept_s  += m.sum(dtype=torch.float64)
-            total_s += torch.tensor(float(m.numel()), dtype=torch.float64, device=device)
+def make_model(in_ch: int, ch: int, k: int, n_blocks: int, device):
+    model = TCN(in_ch=in_ch, ch=ch, k=k, n_blocks=n_blocks, out_ch=2)
+    return model.to(device)
 
-    for t in (tot_loss, n_loss, err_pow, ref_pow, sig_pow, nse_in, nse_out, kept_s, total_s): all_reduce_sum_(t)
-    mean_loss = (tot_loss / torch.clamp_min(n_loss, 1)).item()
-
-    if use_ema is not None: use_ema.restore(model_eval)
-
-    if ref_pow.item() <= eps or kept_s.item() == 0:
-        evm_pct = float("nan"); evm_db = float("nan"); snr_in = float("nan"); snr_out = float("nan"); cov = 0.0
+def train(args):
+    world_size, rank, local_rank = ddp_init_if_needed(backend="nccl" if not args.cpu else "gloo")
+    use_ddp = world_size > 1
+    if not args.cpu and torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
     else:
-        evm_lin = math.sqrt(float((err_pow) / (ref_pow + 1e-12)))
-        evm_pct = 100.0 * evm_lin; evm_db = 20.0 * math.log10(max(1e-12, evm_lin))
-        snr_in  = 10.0 * math.log10(float((sig_pow + 1e-12) / (nse_in + 1e-12)))
-        snr_out = 10.0 * math.log10(float((sig_pow + 1e-12) / (nse_out + 1e-12)))
-        cov = 100.0 * float(kept_s.item() / max(1.0, total_s.item()))
-    return {"loss": mean_loss, "evm_pct": evm_pct, "evm_db": evm_db, "snr_in": snr_in, "snr_out": snr_out, "n": int(n_loss.item()), "ref_cov": cov}
+        device = torch.device("cpu")
+    if rank == 0:
+        print(f"Using device: {device} | world_size={world_size} rank={rank} local_rank={local_rank}")
 
-# ---------------------------
-# EMA helper
-# ---------------------------
+    ds_tr, ds_va, dl_tr, dl_va, W_eff = load_npz_dataset(args.data, args.W, args.H, args.batch, args.workers,
+                                                         world_size=world_size, rank=rank)
 
-class EMA:
-    def __init__(self, model: nn.Module, decay: float = 0.999):
-        self.decay = decay
-        base = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
-        self.shadow = {n: p.detach().clone() for n, p in base.named_parameters() if p.requires_grad}
-        self.back: Dict[str, torch.Tensor] = {}
-    @torch.no_grad()
-    def update(self, model: nn.Module):
-        base = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
-        for n, p in base.named_parameters():
-            if p.requires_grad: self.shadow[n].mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
-    @torch.no_grad()
-    def apply(self, model: nn.Module):
-        base = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
-        self.back = {}
-        for n, p in base.named_parameters():
-            if p.requires_grad:
-                self.back[n] = p.data.clone()
-                p.data.copy_(self.shadow[n])
-    @torch.no_grad()
-    def restore(self, model: nn.Module):
-        if not self.back: return
-        base = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
-        for n, p in base.named_parameters():
-            if p.requires_grad: p.data.copy_(self.back[n])
-        self.back = {}
+    in_ch = 2 if args.input_mode in ("raw","dsp") else 4
+    model = make_model(in_ch, args.width, args.kernel, args.blocks, device)
 
-# ---------------------------
-# Optim / Train
-# ---------------------------
+    if use_ddp:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=None if device.type=="cpu" else [local_rank],
+                                                          output_device=None if device.type=="cpu" else local_rank,
+                                                          find_unused_parameters=False)
 
-def make_optimizer(model: nn.Module, lr: float, wd: Optional[float] = None, **kwargs: Any):
-    if wd is None: wd = kwargs.pop("weight_decay", 0.0)
-    else: _ = kwargs.pop("weight_decay", None)
-    betas = kwargs.pop("betas", (0.9, 0.99)); eps = kwargs.pop("eps", 1e-8)
-    no_decay: Iterable[str] = ["bias", "norm", "bn", "gn", "running_mean", "running_var"]
-    decay_params, nodecay_params = [], []
-    for n, p in model.named_parameters():
-        if not p.requires_grad: continue
-        if any(nd in n.lower() for nd in no_decay) or p.dim() == 1: nodecay_params.append(p)
-        else: decay_params.append(p)
-    param_groups = [{"params": decay_params, "weight_decay": wd}, {"params": nodecay_params, "weight_decay": 0.0}]
-    return torch.optim.AdamW(param_groups, lr=lr, betas=betas, eps=eps)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9,0.99), weight_decay=1e-4)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type=="cuda" and args.amp))
 
-def make_scheduler(opt, sched, epochs, steps_per_epoch, warmup_epochs):
-    total_steps = max(1, epochs * steps_per_epoch); warmup_steps = max(0, int(warmup_epochs * steps_per_epoch))
-    if sched == "cosine":
-        def lr_lambda(step):
-            if step < warmup_steps: return (step + 1) / max(1, warmup_steps)
-            t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-            return 0.5 * (1.0 + math.cos(math.pi * t))
-        return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-    elif sched == "none": return torch.optim.lr_scheduler.LambdaLR(opt, lambda step: 1.0)
-    else: raise ValueError(f"Unknown --sched {sched}")
-
-def train_one_epoch(model, loss_fn, dl, opt, scaler, device, H, accum_steps=1, scheduler=None, ema: Optional[EMA]=None, max_steps=0):
-    model.train(); start = time.time()
-    running = 0.0; steps = 0; samples = 0
-    if is_ddp() and isinstance(dl.sampler, DistributedSampler): pass
-    opt.zero_grad(set_to_none=True)
-    for it, (x, y) in enumerate(dl):
-        x, y = to_device((x, y), device)
-        with autocast("cuda", enabled=(scaler is not None)):
-            yhat, _ = model(x); loss = loss_fn(yhat, y, H) / max(1, accum_steps)
-        if scaler is not None: scaler.scale(loss).backward()
-        else: loss.backward()
-        if ((it + 1) % accum_steps) == 0:
-            if scaler is not None:
-                scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(opt); scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
-            opt.zero_grad(set_to_none=True)
-            if scheduler is not None: scheduler.step()
-            if ema is not None: ema.update(model)
-            steps += 1
-            if max_steps > 0 and steps >= max_steps: break
-        running += float(loss.detach()); samples += x.size(0)
-    elapsed = time.time() - start
-    return running / max(1, (it + 1)), steps, samples, elapsed
-
-# ---------------------------
-# DDP init
-# ---------------------------
-
-def init_distributed(backend="nccl", port: Optional[int] = None):
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"]); world = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    elif "SLURM_PROCID" in os.environ:
-        rank = int(os.environ["SLURM_PROCID"]); world = int(os.environ.get("SLURM_NTASKS", "1"))
-        local_rank = int(os.environ.get("SLURM_LOCALID", "0"))
-    else:
-        rank, world, local_rank = 0, 1, 0
-    if world > 1:
-        if "MASTER_ADDR" not in os.environ:
-            os.environ["MASTER_ADDR"] = os.environ.get("SLURM_LAUNCH_NODE_IPADDR", "127.0.0.1")
-        if "MASTER_PORT" not in os.environ:
-            os.environ["MASTER_PORT"] = str(port or 29500)
-        if torch.cuda.is_available(): torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend=backend, rank=rank, world_size=world)
-    return local_rank
-
-# ---------------------------
-# CLI / Main
-# ---------------------------
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Causal TCN denoiser training (DDP + EMA + robust EVM/SNR)")
-    p.add_argument("--data", type=str, required=True)
-    p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--batch", type=int, default=256, help="per-GPU batch size")
-    p.add_argument("--accum_steps", type=int, default=1)
-    p.add_argument("--amp", action="store_true")
-    p.add_argument("--compile", action="store_true")
-    p.add_argument("--grad_ckpt", action="store_true")
-    # Norm & residual
-    p.add_argument("--use_bn", action="store_true", help="use BatchNorm instead of GroupNorm")
-    p.add_argument("--residual", dest="residual", action=argparse.BooleanOptionalAction, default=True)
-    # Windows
-    p.add_argument("--W", type=int, default=2048)
-    p.add_argument("--H", type=int, default=512)
-    # Model
-    p.add_argument("--width", type=int, default=192)
-    p.add_argument("--blocks", type=int, default=10)
-    p.add_argument("--kernel", type=int, default=5)
-    p.add_argument("--dropout", type=float, default=0.05)
-    # Optim
-    p.add_argument("--lr", type=float, default=3e-3)
-    p.add_argument("--wd", type=float, default=5e-3)
-    p.add_argument("--sched", type=str, default="cosine", choices=["cosine","none"])
-    p.add_argument("--warmup_epochs", type=int, default=5)
-    p.add_argument("--max_steps", type=int, default=0)
-    # IO
-    p.add_argument("--workers", type=int, default=16)
-    p.add_argument("--prefetch", type=int, default=4)
-    p.add_argument("--seed", type=int, default=1337)
-    p.add_argument("--out", type=str, default="tcn_denoiser.pt")
-    p.add_argument("--backend", type=str, default="nccl")
-    # EMA + loss extras
-    p.add_argument("--ema", action="store_true")
-    p.add_argument("--ema_decay", type=float, default=0.999)
-    p.add_argument("--eval_use_ema", action="store_true", help="swap EMA weights during evaluation")
-    p.add_argument("--beta_evm_norm", type=float, default=0.02)
-    p.add_argument("--spec_weight", type=float, default=0.01)
-    # Resume
-    p.add_argument("--resume", type=str, default="")
-    p.add_argument("--resume_all", action="store_true")
-    return p.parse_args()
-
-def main():
-    args = parse_args()
-    set_seed(args.seed); torch.backends.cudnn.benchmark = True
-    local_rank = init_distributed(backend=args.backend)
-    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
-    if torch.cuda.is_available(): torch.cuda.setDevice = torch.cuda.set_device(device)
-
-    if ddp_rank() == 0:
-        only_rank0_print(f"Device: {device} | seed {args.seed} | world_size {ddp_world_size()} | rank {ddp_rank()}")
-
-    # Data
-    data_path = Path(args.data).expanduser().resolve()
-    ds_tr, ds_va, ds_te, dl_tr, dl_va, dl_te, W_eff = load_npz_dataset(
-        data_path, W=args.W, H=args.H, batch=args.batch, workers=args.workers, prefetch=args.prefetch)
-
-    # Model
-    model = TCN(in_ch=2, ch=args.width, out_ch=2, k=args.kernel, blocks=args.blocks,
-                dropout=args.dropout, use_ckpt=args.grad_ckpt, use_bn=args.use_bn, residual=args.residual).to(device)
-    if args.compile and hasattr(torch, "compile"): model = torch.compile(model)
-    only_rank0_print(f"Params: {numel(model)/1e6:.2f}M | W {W_eff} H {args.H} | width {args.width} blocks {args.blocks} k {args.kernel}")
-
-    # Loss/optim/sched
-    loss_fn = MaskedTimeLoss(alpha=0.05, beta_evm_norm=args.beta_evm_norm, spec_weight=args.spec_weight)
-    opt = make_optimizer(model, lr=args.lr, wd=args.wd)
-    steps_per_epoch = max(1, len(dl_tr) // max(1, args.accum_steps))
-    scheduler = make_scheduler(opt, args.sched, args.epochs, steps_per_epoch, args.warmup_epochs)
-    scaler = GradScaler("cuda", enabled=args.amp)
-
-    # DDP wrap
-    if ddp_world_size() > 1:
-        model = nn.parallel.DistributedDataParallel(
-            model, device_ids=[device.index] if device.type=="cuda" else None,
-            output_device=device.index if device.type=="cuda" else None,
-            find_unused_parameters=False
-        )
-
-    # EMA
-    ema = EMA(model, decay=args.ema_decay) if args.ema else None
-
-    # Resume
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
-        (model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model).load_state_dict(ckpt["model"], strict=True)
-        # If we have an EMA object and the checkpoint carries ema_state, restore it
-    if ema is not None and isinstance(ckpt, dict) and ("ema_state" in ckpt):
-        for n, p in ema.shadow.items():
-            if n in ckpt["ema_state"]:
-                p.copy_(ckpt["ema_state"][n].to(p.device))
-        only_rank0_print("[resume] Restored EMA shadow from checkpoint.")
-    elif ema is not None:
-        only_rank0_print("[resume] No ema_state in checkpoint; will create/save it now.")
-
-        if args.resume_all and "opt" in ckpt and "sched" in ckpt:
-            try:
-                opt.load_state_dict(ckpt["opt"]); scheduler.load_state_dict(ckpt["sched"])
-                if "scaler" in ckpt and scaler is not None: scaler.load_state_dict(ckpt["scaler"])
-            except Exception as e:
-                only_rank0_print(f"[resume] Warning: could not fully load optimizer/scheduler: {e}")
+    loss_fn = CompositeLoss(fs=args.fs, inband_hz=args.inband_hz, guard_hz=args.guard_hz,
+                            spec_weight=args.spec_weight, w_in=args.spec_w_in, w_guard=args.spec_w_guard, w_out=args.spec_w_out,
+                            smooth_weight=args.smooth_weight, evm_norm_weight=args.evm_norm_weight)
 
     best_val = float("inf")
-    for epoch in range(1, args.epochs + 1):
-        if isinstance(dl_tr.sampler, DistributedSampler): dl_tr.sampler.set_epoch(epoch)
 
-        train_loss, steps_done, samples_seen, sec = train_one_epoch(
-            model, loss_fn, dl_tr, opt, scaler, device, args.H,
-            accum_steps=args.accum_steps, scheduler=scheduler, ema=ema, max_steps=args.max_steps)
+    for epoch in range(1, args.epochs+1):
+        if use_ddp and hasattr(dl_tr.sampler, "set_epoch"):
+            dl_tr.sampler.set_epoch(epoch)
+        model.train()
+        t0 = time.time(); run_loss = 0.0; m = 0
+        for x, y in dl_tr:
+            x = x.to(device, non_blocking=True); y = y.to(device, non_blocking=True)
+            if args.prefilter != "none" or args.input_mode != "raw":
+                dsp_x = apply_prefilter(x, args.fs, args.prefilter, args.inband_hz, args.guard_hz,
+                                        args.prefilter_max_depth_in, args.prefilter_max_depth_out)
+            else:
+                dsp_x = x
 
-        with torch.no_grad():
-            val = evaluate(model, loss_fn, dl_va, device, args.H, use_ema=(ema if args.eval_use_ema else None))
+            if args.input_mode == "raw":
+                xin = x
+            elif args.input_mode == "dsp":
+                xin = dsp_x
+            elif args.input_mode == "dualpath":
+                xin = torch.cat([x, dsp_x], dim=-1)
+            else:
+                raise ValueError("invalid --input-mode")
 
-        if ddp_rank() == 0:
-            delta = (val['snr_out'] - val['snr_in']) if (not math.isnan(val['snr_in']) and not math.isnan(val['snr_out'])) else float('nan')
-            print(f"Epoch {epoch:03d} | train {train_loss:.6f} | val {val['loss']:.6f} | "
-                  f"EVM% {val['evm_pct']:.2f} ({val['evm_db']:.2f} dB) | "
-                  f"SNR_in {val['snr_in']:.2f} → SNR_out {val['snr_out']:.2f} | Δ {delta:+.2f} dB | "
-                  f"cov {val['ref_cov']:.1f}% | lr {scheduler.get_last_lr()[0]:.2e} | {sec/60:.02f} min")
-            if val['loss'] < best_val:
-                best_val = val['loss']
-                base_model = (model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model)
-                to_save = {
-                    "model": base_model.state_dict(),
-                    "opt": opt.state_dict(),
-                    "sched": scheduler.state_dict(),
-                    "scaler": (scaler.state_dict() if scaler is not None else {}),
-                    "args": vars(args),
-                }
-                # NEW: persist EMA so eval/visualize can load the validated weights
-                if ema is not None:
-                    to_save["ema_state"] = {k: v.detach().clone() for k, v in ema.shadow.items()}
-                    to_save["ema_decay"] = ema.decay
-                    to_save["eval_used_ema"] = bool(args.eval_use_ema)
+            opt.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=(device.type=="cuda" and args.amp)):
+                yhat = model(xin)
+                loss = loss_fn(yhat, y)
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
 
-                torch.save(to_save, args.out)
-                print(f"  ↳ saved -> {args.out}")
+            run_loss += float(loss.detach().cpu()); m += 1
 
+        model.eval()
+        tot_loss = torch.tensor([0.0], device=device); tot_n = torch.tensor([0.0], device=device)
+        evm_pct_s, evm_db_s, snr_in_s, snr_out_s = torch.tensor([0.0], device=device), torch.tensor([0.0], device=device), torch.tensor([0.0], device=device), torch.tensor([0.0], device=device)
+        cnt = torch.tensor([0.0], device=device)
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type=="cuda" and args.amp)):
+            for x, y in dl_va:
+                x = x.to(device, non_blocking=True); y = y.to(device, non_blocking=True)
+                if args.input_mode == "dualpath" or args.input_mode == "dsp" or args.prefilter != "none":
+                    dsp_x = apply_prefilter(x, args.fs, args.prefilter, args.inband_hz, args.guard_hz,
+                                            args.prefilter_max_depth_in, args.prefilter_max_depth_out)
+                else:
+                    dsp_x = x
+                if args.input_mode == "raw":
+                    xin = x
+                elif args.input_mode == "dsp":
+                    xin = dsp_x
+                else:
+                    xin = torch.cat([x, dsp_x], dim=-1)
+                yhat = model(xin)
+                l = loss_fn(yhat, y)
+                tot_loss += l.detach()
+                B = torch.tensor([x.size(0)], device=device, dtype=torch.float32)
+                tot_n += B
+                evm_pct, evm_db = evm_pct_and_db(y, yhat); ein, eout = snr_db(y, yhat, x[...,:2])
+                evm_pct_s += evm_pct.detach(); evm_db_s += evm_db.detach()
+                snr_in_s  += ein.detach();     snr_out_s += eout.detach()
+                cnt += 1.0
 
-    with torch.no_grad():
-        te = evaluate(model, loss_fn, dl_te, device, args.H, use_ema=(ema if args.eval_use_ema else None))
-    if ddp_rank() == 0:
-        delta = (te['snr_out'] - te['snr_in']) if (not math.isnan(te['snr_in']) and not math.isnan(te['snr_out'])) else float('nan')
-        print("=== TEST === "
-              f" loss {te['loss']:.6f} | EVM% {te['evm_pct']:.2f} ({te['evm_db']:.2f} dB) "
-              f"| SNR_in {te['snr_in']:.2f} → SNR_out {te['snr_out']:.2f} | Δ {delta:+.2f} dB "
-              f"| cov {te['ref_cov']:.1f}%")
+        for t in (tot_loss, tot_n, evm_pct_s, evm_db_s, snr_in_s, snr_out_s, cnt):
+            ddp_all_reduce_tensor(t, op=dist.ReduceOp.SUM)
 
-    if dist.is_initialized(): dist.destroy_process_group()
+        if rank == 0:
+            val_loss = (tot_loss / torch.clamp_min(tot_n, 1.0)).item()
+            evm_pct_m = (evm_pct_s / torch.clamp_min(cnt, 1.0)).item()
+            evm_db_m  = (evm_db_s  / torch.clamp_min(cnt, 1.0)).item()
+            snr_in_m  = (snr_in_s  / torch.clamp_min(cnt, 1.0)).item()
+            snr_out_m = (snr_out_s / torch.clamp_min(cnt, 1.0)).item()
+            dt = time.time() - t0
+            print(f"Epoch {epoch:03d} | train {run_loss/max(1,m):.6f} | val {val_loss:.6f} | "
+                  f"EVM% {evm_pct_m:.2f} ({evm_db_m:.2f} dB) | "
+                  f"SNR_in {snr_in_m:.2f} → SNR_out {snr_out_m:.2f} | {dt/60:.2f} min")
+
+            if val_loss < best_val:
+                best_val = val_loss
+                ckpt = {"model": model.module.state_dict() if use_ddp else model.state_dict(), "args": vars(args)}
+                outp = Path(args.out); outp.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(ckpt, str(outp))
+                print(f"  ↳ saved -> {outp}")
+
+    if dist.is_initialized():
+        ddp_barrier()
+        if rank == 0:
+            print("Training done (DDP).")
+    else:
+        print("Training done.")
+
+# ---------------------------
+# CLI
+# ---------------------------
+
+def build_argparser():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", type=str, required=True, help="Path to .npz dataset (Xtr/Ytr/Xva/Yva)")
+    # Core data/time
+    ap.add_argument("--fs", "--sample_rate", dest="fs", type=float, default=4.092e6, help="Sampling rate (Hz)")
+    ap.add_argument("--W", type=int, default=4092, help="Window length (samples)")
+    ap.add_argument("--H", type=int, default=4092, help="Hop (samples) for train windows")
+    ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--workers", type=int, default=4)
+    # Model
+    ap.add_argument("--width", type=int, default=160, help="TCN hidden channels")
+    ap.add_argument("--blocks", type=int, default=10, help="Number of residual dilated blocks")
+    ap.add_argument("--kernel", type=int, default=7, help="Kernel size")
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--out", type=str, default="tcn_denoiser.pt")
+    ap.add_argument("--cpu", action="store_true", help="Force CPU")
+    ap.add_argument("--amp", action="store_true", help="Mixed precision training")
+    # Prefilter + inputs
+    ap.add_argument("--prefilter", type=str, default="none", choices=["none","stft_gate","notch"])
+    ap.add_argument("--input-mode","--input_mode", dest="input_mode", type=str, default="raw", choices=["raw","dsp","dualpath"])
+    ap.add_argument("--inband-hz","--inband_hz", dest="inband_hz", type=float, default=1.2e6)
+    ap.add_argument("--guard-hz","--guard_hz", dest="guard_hz", type=float, default=1.8e6)
+    ap.add_argument("--prefilter-max-depth-in","--prefilter_max_depth_in", dest="prefilter_max_depth_in", type=float, default=18.0, help="Max attenuation in-band (dB)")
+    ap.add_argument("--prefilter-max-depth-out","--prefilter_max_depth_out", dest="prefilter_max_depth_out", type=float, default=30.0, help="Max attenuation out-of-band (dB)")
+    # Loss weights (hyphen + underscore aliases)
+    ap.add_argument("--spec-weight","--spec_weight", dest="spec_weight", type=float, default=0.04)
+    ap.add_argument("--spec-w-in","--spec_w_in", dest="spec_w_in", type=float, default=0.5)
+    ap.add_argument("--spec-w-guard","--spec_w_guard", dest="spec_w_guard", type=float, default=1.0)
+    ap.add_argument("--spec-w-out","--spec_w_out", dest="spec_w_out", type=float, default=2.0)
+    ap.add_argument("--smooth-weight","--smooth_weight", dest="smooth_weight", type=float, default=0.05)
+    ap.add_argument("--evm-norm-weight","--beta_evm_norm","--evm_norm_weight", dest="evm_norm_weight", type=float, default=0.02)
+    # Backward‑compat harmless no‑ops so old sbatches don't crash
+    ap.add_argument("--compile", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--grad_ckpt", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--use_bn", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--residual", dest="residual", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--no-residual", dest="residual", action="store_false", help=argparse.SUPPRESS)
+    ap.set_defaults(residual=True)
+    ap.add_argument("--wd", type=float, default=1e-4, help=argparse.SUPPRESS)
+    ap.add_argument("--sched", type=str, default="none", choices=["none","cosine"], help=argparse.SUPPRESS)
+    ap.add_argument("--warmup_epochs", type=int, default=0, help=argparse.SUPPRESS)
+    ap.add_argument("--max_steps", type=int, default=0, help=argparse.SUPPRESS)
+    ap.add_argument("--prefetch", type=int, default=4, help=argparse.SUPPRESS)
+    ap.add_argument("--seed", type=int, default=1337, help=argparse.SUPPRESS)
+    ap.add_argument("--ema", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--ema_decay", type=float, default=0.999, help=argparse.SUPPRESS)
+    ap.add_argument("--eval_use_ema", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--resume", type=str, default="", help=argparse.SUPPRESS)
+    ap.add_argument("--resume_all", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--backend", type=str, default="nccl", help=argparse.SUPPRESS)
+    return ap
+
+def main():
+    args = build_argparser().parse_args()
+    train(args)
 
 if __name__ == "__main__":
     main()
