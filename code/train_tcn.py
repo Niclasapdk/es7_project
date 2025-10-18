@@ -2,21 +2,17 @@
 """
 train_tcn.py — Causal TCN denoiser for baseband IQ with optional DSP prefilter.
 
-Highlights
-- Causal TCN (dilated residual blocks)
-- Input modes: raw | dsp | dualpath          (2-ch raw IQ, 2-ch DSP IQ, or 4-ch concat)
-- Prefilter: none | stft_gate | notch         (simple frequency gating / gaussian notch)
-- Band-aware spectral loss (in-band / guard / out-of-band weights)
-- AMP + DDP (torchrun) with clean shutdown; rank-0 only prints/saves
-- Per-step progress logging: --progress and --log-every N
-- Periodic eval/save: --eval-every, --save-every
-- CSV logging: --log-csv /path/to/log.csv
+Additions in this build
+- Aligned & unaligned EVM metrics (timing + complex LS scale/phase)
+- EMA weights (--ema, --ema-decay, --eval-use-ema, --save-ema)
+- Cosine LR scheduler with optional warmup (--sched cosine, --warmup-epochs, --min-lr)
+- CSV logs include both aligned & unaligned EVM + SNR_out(EVM_aligned)
 """
 
 from __future__ import annotations
 import os, time, math, argparse, csv, warnings
 from pathlib import Path
-from typing import Dict, Tuple, Union, Sequence
+from typing import Dict, Tuple, Union, Sequence, Optional
 
 import numpy as np
 import torch
@@ -26,10 +22,9 @@ from torch import amp
 from torch.utils.data import Dataset, DataLoader
 import torch.distributed as dist
 
-# Use TF32 on Ampere+ where available (new-style API suggestion maps to this helper)
+# Use TF32 on Ampere+ where available
 torch.set_float32_matmul_precision("high")
 
-# Quiet the pynvml deprecation spam coming from torch.cuda init
 warnings.filterwarnings("ignore", message="The pynvml package is deprecated")
 
 # ---------------------------
@@ -59,22 +54,14 @@ def ddp_all_reduce_(t: torch.Tensor, op=dist.ReduceOp.SUM):
 
 # ---------------------------
 # IQ / complex utilities
-# ---------------------------
+# ---------------------------                                           # back to [B,T,2]
 
 def _ensure_iq_last_contig(x: torch.Tensor) -> torch.Tensor:
-    """
-    Ensure IQ is channels-last (..., 2) and contiguous. If channels-first (B,2,T) sneaks in,
-    we transpose to (B,T,2).
-    """
     if x.ndim >= 3 and x.shape[-1] != 2 and x.shape[1] == 2:
         x = x.transpose(1, -1)
     return x.contiguous()
 
 def complex_from_iq(x: torch.Tensor) -> torch.Tensor:
-    """
-    Convert (...,2) float -> complex tensor (...).
-    Uses torch.complex to avoid view_as_complex stride pitfalls.
-    """
     if torch.is_complex(x):
         return x
     x = _ensure_iq_last_contig(x).to(torch.float32)
@@ -83,7 +70,6 @@ def complex_from_iq(x: torch.Tensor) -> torch.Tensor:
     return torch.complex(x[..., 0], x[..., 1])
 
 def iq_from_complex(z: torch.Tensor) -> torch.Tensor:
-    """complex (...,) -> (...,2) float"""
     if not torch.is_complex(z):
         raise RuntimeError("Expected complex tensor")
     return torch.stack([z.real, z.imag], dim=-1)
@@ -94,7 +80,7 @@ def iq_from_complex(z: torch.Tensor) -> torch.Tensor:
 
 def _canonicalize_bt2(a: np.ndarray) -> np.ndarray:
     a = np.asarray(a)
-    if a.ndim == 2 and a.shape[1] == 2:  # (T,2) -> (1,T,2)
+    if a.ndim == 2 and a.shape[1] == 2:
         a = a[None, ...]
     if not (a.ndim == 3 and a.shape[-1] == 2):
         raise ValueError(f"Expected [N,T,2] but got {a.shape}")
@@ -104,14 +90,12 @@ def _find_sets(npz: Dict[str, np.ndarray]):
     k = set(npz.keys())
     if {"Xtr","Ytr","Xva","Yva"}.issubset(k):
         Xtr, Ytr, Xva, Yva = npz["Xtr"], npz["Ytr"], npz["Xva"], npz["Yva"]
-        # split Xva/Yva into val/test halves for convenience
         mid = max(1, Xva.shape[0] // 2)
         return {"train": (Xtr, Ytr), "val": (Xva[:mid], Yva[:mid]), "test": (Xva[mid:], Yva[mid:])}
     if {"X","Y"}.issubset(k):
         X, Y = npz["X"], npz["Y"]
         N = X.shape[0]
-        ntr = int(0.8 * N)
-        nva = int(0.1 * N)
+        ntr = int(0.8 * N); nva = int(0.1 * N)
         return {"train": (X[:ntr], Y[:ntr]),
                 "val":   (X[ntr:ntr+nva], Y[ntr:ntr+nva]),
                 "test":  (X[ntr+nva:], Y[ntr+nva:])}
@@ -181,29 +165,22 @@ def stft_gate_prefilter(x: torch.Tensor, fs: float,
                         inband_hz: Union[float, Sequence[float]],
                         guard_hz: float = 0.0,
                         max_depth_out_db: float = 120.0) -> torch.Tensor:
-    """
-    Frequency-gate a complex stream by attenuating (or zeroing) out-of-band bins.
-    Accepts [B,T,2] IQ or complex [B,T] or real [B,T]. Returns in the same "complexness"
-    as the input (IQ if input was IQ; complex if input was complex; real if real).
-    """
-    # Convert to complex [B,T], but remember how to format the output back
     def _as_complex(x: torch.Tensor):
-        if x.ndim == 3 and x.shape[-1] == 2:         # IQ
+        if x.ndim == 3 and x.shape[-1] == 2:
             z = complex_from_iq(x)
             def fmt(yc): return iq_from_complex(yc)
             return z, fmt
-        if torch.is_complex(x):                      # already complex
+        if torch.is_complex(x):
             def fmt(yc): return yc
             return x, fmt
-        # real mono
         xr = x.to(torch.float32)
         def fmt(yc): return yc.real
         return xr, fmt
 
     x_c, fmt = _as_complex(x)
     B, T = x_c.shape
-    X = torch.fft.fft(x_c, n=T, dim=1)  # complex spectrum
-    freqs = torch.fft.fftfreq(T, d=1.0 / fs, device=x.device)  # [-fs/2, fs/2)
+    X = torch.fft.fft(x_c, n=T, dim=1)
+    freqs = torch.fft.fftfreq(T, d=1.0 / fs, device=x.device)
 
     if isinstance(inband_hz, (list, tuple)) and len(inband_hz) == 2:
         lo, hi = float(inband_hz[0]) - guard_hz, float(inband_hz[1]) + guard_hz
@@ -213,23 +190,19 @@ def stft_gate_prefilter(x: torch.Tensor, fs: float,
 
     passmask = (freqs >= lo) & (freqs <= hi)
 
-    if max_depth_out_db >= 200:  # effectively infinite
+    if max_depth_out_db >= 200:
         X[:, ~passmask] = 0
     else:
         att = 10.0 ** (-max_depth_out_db / 20.0)
         X[:, ~passmask] *= att
 
-    x_f = torch.fft.ifft(X, n=T, dim=1)  # complex back to time
+    x_f = torch.fft.ifft(X, n=T, dim=1)
     return fmt(x_f)
 
 def notch_prefilter(x: torch.Tensor, fs: float,
                     inband_hz: float, guard_hz: float,
                     max_depth_in: float = 40.0, max_depth_out: float = 80.0,
                     q: float = 600.0) -> torch.Tensor:
-    """
-    Simple gaussian-shaped notch around the strongest bin in rFFT (real spectrum).
-    Works on complex stream; returns same complexness as input.
-    """
     def _as_complex(x: torch.Tensor):
         if x.ndim == 3 and x.shape[-1] == 2:
             z = complex_from_iq(x)
@@ -284,10 +257,8 @@ def apply_prefilter(x: torch.Tensor, fs: float, prefilter: str,
     if pf in {"stft_gate", "stft-gate", "fft_gate"}:
         return stft_gate_prefilter(x, fs, inband_hz, guard_hz, max_depth_out_db)
     if pf == "notch":
-        # notch depth depends on whether the peak lies inside the signal band
         return notch_prefilter(x, fs, inband_hz if isinstance(inband_hz, (int, float)) else float(inband_hz[-1]),
                                guard_hz, max_depth_in_db, max_depth_out_db)
-    # unknown -> identity
     return x
 
 # ---------------------------
@@ -329,22 +300,19 @@ class TCN(nn.Module):
         self.blocks = nn.Sequential(*blocks)
         self.out = nn.Conv1d(ch, out_ch, 1)
     def forward(self, x_btc):
-        # x: [B,T,C] -> [B,C,T]
         x = x_btc.permute(0, 2, 1)
         h = self.inp(x)
         h = self.blocks(h)
         y = self.out(h)
-        # back to [B,T,C]
         return y.permute(0, 2, 1)
 
 # ---------------------------
-# Loss & metrics
+# Loss & metrics + alignment
 # ---------------------------
 
 Number = Union[int, float]
 
 def _to_hz(v: Number, fs: float) -> float:
-    # allow normalized (0..1 => 0..Nyquist) or absolute Hz
     v = float(v)
     return v * (fs / 2.0) if 0.0 <= v <= 1.0 else v
 
@@ -403,66 +371,103 @@ def _canon_guard(guard: Union[Tuple[Number, Number], Number, dict, None],
     return lo_hz, hi_hz
 
 def spectral_loss(y_true, y_pred, fs, inband, guard, w_in=1.0, w_guard=1.0, w_out=1.0):
-    """
-    y_true, y_pred: (B,T,2) IQ or complex (B,T). Computes band-aware power loss.
-    """
     y_true = _ensure_iq_last_contig(y_true)
     y_pred = _ensure_iq_last_contig(y_pred)
     yt = y_true if torch.is_complex(y_true) else complex_from_iq(y_true)
     yp = y_pred if torch.is_complex(y_pred) else complex_from_iq(y_pred)
-
     assert yt.ndim == 2 and yp.ndim == 2, f"Expected (B,T) complex tensors, got {yt.shape}, {yp.shape}"
     B, T = yt.shape
-
     YT = torch.fft.fft(yt, n=T, dim=1)
     YP = torch.fft.fft(yp, n=T, dim=1)
     freqs = torch.fft.fftfreq(T, d=1.0 / fs).to(yt.device)
     pos = freqs >= 0
     freqs = freqs[pos]; YT = YT[:, pos]; YP = YP[:, pos]
-
     PT = (YT.abs() ** 2)
     PP = (YP.abs() ** 2)
-
     f_lo, f_hi = _canon_band(inband, fs)
     g_lo, g_hi = _canon_guard(guard, f_hi, fs)
-
     m_in    = (freqs >= f_lo) & (freqs <= f_hi)
     m_guard = (freqs >  f_hi) & (freqs <= g_lo)
     m_out   = (freqs >  g_hi)
-
     def _mean_mask(x, m):
         if not m.any(): return x.new_zeros(x.size(0))
         return x[:, m].mean(dim=1)
-
     loss_in    = _mean_mask((PP - PT).abs(), m_in)
-    loss_guard = _mean_mask(PP, m_guard)   # penalize power in guard
-    loss_out   = _mean_mask(PP, m_out)     # penalize OOB power
-
+    loss_guard = _mean_mask(PP, m_guard)
+    loss_out   = _mean_mask(PP, m_out)
     return (w_in * loss_in + w_guard * loss_guard + w_out * loss_out).mean()
 
 def first_diff_loss(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
-    """Smoothness in time domain (L1 on first differences)."""
     yt = y_true[:, 1:, :] - y_true[:, :-1, :]
     yp = y_pred[:, 1:, :] - y_pred[:, :-1, :]
     return F.l1_loss(yp, yt)
 
-def evm_pct_and_db(y_true, y_pred, eps: float = 1e-12):
+# ---------- Alignment helpers ----------
+
+@torch.no_grad()
+def _best_lag(y: torch.Tensor, yhat: torch.Tensor, maxlag: int = 64) -> Tuple[torch.Tensor, int]:
     """
-    RMS EVM in percent and dB. Accepts (B,T,2) IQ or complex (B,T).
+    Crude per-batch timing alignment via cross-correlation (complex).
+    y, yhat: (B,T) complex
+    Returns yhat_shifted, chosen_lag (int for info only; if varying per-batch, returns 0)
     """
+    B, T = y.shape
+    Y = torch.fft.fft(y, n=T, dim=1)
+    H = torch.fft.fft(yhat, n=T, dim=1)
+    cc = torch.fft.ifft(Y * torch.conj(H), n=T, dim=1)  # circular correlation
+    cc = torch.fft.fftshift(cc, dim=1)
+    lags = torch.arange(-T//2, T//2, device=y.device)
+    m = (lags >= -maxlag) & (lags <= maxlag)
+    ccw = cc[:, m]
+    lagsw = lags[m]
+    peak_idx = torch.argmax(ccw.abs(), dim=1)
+    best_lags = lagsw[peak_idx]  # (B,)
+    # shift each batch separately along time dim
+    yhat_s = torch.empty_like(yhat)
+    for b, sft in enumerate(best_lags.tolist()):
+        yhat_s[b] = torch.roll(yhat[b], shifts=int(sft), dims=0)
+    same = torch.all(best_lags == best_lags[0])
+    return yhat_s, int(best_lags[0].item()) if same else 0
+
+def _ls_align(y: torch.Tensor, yhat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Differentiable complex LS align: alpha = <yhat,y> / <yhat,yhat>.
+    y, yhat: (B,T) complex. Returns (aligned_yhat, alpha).
+    """
+    num = torch.sum(torch.conj(yhat) * y, dim=1)        # (B,)
+    den = torch.sum(torch.conj(yhat) * yhat, dim=1)
+    den = den.real.clamp_min(1e-12)                     # keep real, avoid div-by-zero
+    alpha = num / den                                   # (B,)
+    yhat_al = alpha[:, None] * yhat
+    return yhat_al, alpha
+
+@torch.no_grad()
+def evm_unaligned(y_true, y_pred):
     yt = y_true if torch.is_complex(y_true) else complex_from_iq(_ensure_iq_last_contig(y_true))
     yp = y_pred if torch.is_complex(y_pred) else complex_from_iq(_ensure_iq_last_contig(y_pred))
-    err_pow = (yp - yt).abs().pow(2).sum(dim=1, keepdim=True)                # sum |e|^2 over time
-    ref_pow = yt.abs().pow(2).sum(dim=1, keepdim=True).clamp_min(eps)        # sum |ref|^2
-    evm_rms = torch.sqrt(err_pow / ref_pow).squeeze(1)                       # (B,)
-    evm_pct = evm_rms * 100.0
-    evm_db  = 20.0 * torch.log10(evm_rms.clamp_min(eps))
+    err_pow = (yp - yt).abs().pow(2).sum(dim=1)
+    ref_pow = yt.abs().pow(2).sum(dim=1).clamp_min(1e-12)
+    evm_rms = torch.sqrt(err_pow / ref_pow)
+    evm_pct = 100.0 * evm_rms
+    evm_db  = 20.0 * torch.log10(evm_rms.clamp_min(1e-12))
     return evm_pct, evm_db
 
+@torch.no_grad()
+def evm_aligned(y_true, y_pred, do_timing: bool = True, maxlag: int = 64):
+    yt = y_true if torch.is_complex(y_true) else complex_from_iq(_ensure_iq_last_contig(y_true))
+    yp = y_pred if torch.is_complex(y_pred) else complex_from_iq(_ensure_iq_last_contig(y_pred))
+    if do_timing:
+        yp, _ = _best_lag(yt, yp, maxlag=maxlag)
+    yp_s, alpha = _ls_align(yt, yp)
+    err_pow = (yp_s - yt).abs().pow(2).sum(dim=1)
+    ref_pow = yt.abs().pow(2).sum(dim=1).clamp_min(1e-12)
+    evm_rms = torch.sqrt(err_pow / ref_pow)
+    evm_pct = 100.0 * evm_rms
+    evm_db  = 20.0 * torch.log10(evm_rms.clamp_min(1e-12))
+    return evm_pct, evm_db
+
+@torch.no_grad()
 def snr_db(y_true, y_pred, x_in, eps: float = 1e-12):
-    """
-    SNR in/out (dB) using input stream x_in as "noisy" and y_true as "clean" reference.
-    """
     yt = y_true if torch.is_complex(y_true) else complex_from_iq(_ensure_iq_last_contig(y_true))
     yp = y_pred if torch.is_complex(y_pred) else complex_from_iq(_ensure_iq_last_contig(y_pred))
     xx = x_in   if torch.is_complex(x_in)   else complex_from_iq(_ensure_iq_last_contig(x_in))
@@ -474,7 +479,7 @@ def snr_db(y_true, y_pred, x_in, eps: float = 1e-12):
     return snr_in.mean(), snr_out.mean()
 
 class CompositeLoss(nn.Module):
-    def __init__(self, fs: float, inband_hz: Union[float, Sequence[float]], guard_hz: float,
+    def __init__(self, fs: float, inband_hz, guard_hz,
                  spec_weight: float, w_in: float, w_guard: float, w_out: float,
                  smooth_weight: float, evm_norm_weight: float):
         super().__init__()
@@ -483,14 +488,90 @@ class CompositeLoss(nn.Module):
         self.w_in = w_in; self.w_guard = w_guard; self.w_out = w_out
         self.smooth_weight = smooth_weight
         self.evm_norm_weight = evm_norm_weight
+
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        l_time   = F.l1_loss(y_pred, y_true)
-        l_spec   = spectral_loss(y_true, y_pred, self.fs, self.inband, self.guard,
-                                 self.w_in, self.w_guard, self.w_out)
-        l_smooth = first_diff_loss(y_true, y_pred)
-        evm_pct, _ = evm_pct_and_db(y_true, y_pred)
-        l_evmn = (evm_pct / 100.0).mean()
+        # complex views
+        yt = complex_from_iq(_ensure_iq_last_contig(y_true))
+        yp = complex_from_iq(_ensure_iq_last_contig(y_pred))
+        # align (grad-enabled)
+        yp_al, _ = _ls_align(yt, yp)
+        y_pred_al = iq_from_complex(yp_al)
+
+        l_time   = F.l1_loss(y_pred_al, y_true)
+        l_spec   = spectral_loss(y_true, y_pred_al, self.fs, self.inband, self.guard,
+                                self.w_in, self.w_guard, self.w_out)
+        l_smooth = first_diff_loss(y_true, y_pred_al)
+
+        # optional EVM-normalization term as a CONSTANT (no grads needed)
+        with torch.no_grad():
+            evm_pct, _ = evm_unaligned(y_true, y_pred_al)
+            l_evmn = (evm_pct / 100.0).mean()
+
         return l_time + self.spec_weight * l_spec + self.smooth_weight * l_smooth + self.evm_norm_weight * l_evmn
+
+# ---------------------------
+# EMA utils
+# ---------------------------
+
+class EMA:
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.shadow = {}
+        self.backup = {}
+        for name, p in self._named_params(model):
+            self.shadow[name] = p.detach().clone()
+
+    def _named_params(self, model: nn.Module):
+        m = model.module if hasattr(model, "module") else model
+        for name, p in m.named_parameters():
+            if p.requires_grad:
+                yield name, p
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        for name, p in self._named_params(model):
+            self.shadow[name].mul_(self.decay).add_(p.detach(), alpha=(1.0 - self.decay))
+
+    @torch.no_grad()
+    def apply_shadow(self, model: nn.Module):
+        self.backup = {}
+        m = model.module if hasattr(model, "module") else model
+        for name, p in m.named_parameters():
+            if p.requires_grad:
+                self.backup[name] = p.data.detach().clone()
+                p.data.copy_(self.shadow[name].to(p.device))
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module):
+        if not self.backup:
+            return
+        m = model.module if hasattr(model, "module") else model
+        for name, p in m.named_parameters():
+            if p.requires_grad and name in self.backup:
+                p.data.copy_(self.backup[name])
+        self.backup = {}
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        return {k: v.clone().cpu() for k, v in self.shadow.items()}
+
+# ---------------------------
+# Scheduler
+# ---------------------------
+
+def build_scheduler(optimizer, sched: str, base_lr: float, epochs: int, warmup_epochs: int, min_lr: float):
+    if sched == "none":
+        return None
+    if sched == "cosine":
+        def lr_lambda(epoch: int):
+            e = epoch
+            if warmup_epochs > 0 and e < warmup_epochs:
+                return max(1e-8, float(e + 1) / float(warmup_epochs))
+            t = (e - warmup_epochs) / max(1, (epochs - warmup_epochs))
+            cos_out = 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, t))))
+            min_scale = min_lr / max(1e-12, base_lr)
+            return min_scale + (1.0 - min_scale) * cos_out
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    raise ValueError(f"Unknown scheduler: {sched}")
 
 # ---------------------------
 # Train / Eval
@@ -532,6 +613,14 @@ def train(args):
     use_amp = (device.type == "cuda" and args.amp)
     scaler  = amp.GradScaler('cuda', enabled=use_amp)
 
+    # EMA
+    ema: Optional[EMA] = None
+    if args.ema:
+        ema = EMA(model, decay=args.ema_decay)
+
+    # Scheduler
+    scheduler = build_scheduler(opt, args.sched, args.lr, args.epochs, args.warmup_epochs, args.min_lr)
+
     loss_fn = CompositeLoss(
         fs=args.fs, inband_hz=args.inband_hz, guard_hz=args.guard_hz,
         spec_weight=args.spec_weight, w_in=args.spec_w_in, w_guard=args.spec_w_guard, w_out=args.spec_w_out,
@@ -544,7 +633,10 @@ def train(args):
         if not logp.exists():
             with logp.open("w", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["epoch","train_loss","val_loss","evm_pct","evm_db","snr_in","snr_out","minutes"])
+                w.writerow(["epoch","train_loss","val_loss",
+                            "evm_unalign_pct","evm_unalign_db",
+                            "evm_align_pct","evm_align_db",
+                            "snr_in","snr_out","snr_out_evm_aligned","minutes","lr"])
 
     best_val = float("inf")
     global_step = 0
@@ -579,13 +671,28 @@ def train(args):
 
             opt.zero_grad(set_to_none=True)
             with amp.autocast('cuda', enabled=use_amp):
-                yhat = model(xin)
+                core = model(xin)  # model predicts the correction
+                # choose identity base:
+                if args.input_mode == "raw":
+                    base = x
+                elif args.input_mode == "dsp":
+                    base = dsp_x
+                elif args.input_mode == "dualpath":
+                    base = x  # identity to raw path
+                else:
+                    raise ValueError("invalid --input-mode")
+
+                yhat = base + core
                 loss = loss_fn(yhat, y)
+
 
             scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
+
+            if ema is not None:
+                ema.update(model)
 
             # stats
             loss_v = float(loss.detach().cpu())
@@ -601,19 +708,32 @@ def train(args):
                     step_rate = step / max(1e-9, elapsed)
                     rem_steps = steps_total - step
                     eta_min = (rem_steps / max(1e-9, step_rate)) / 60.0
+                    cur_lr = opt.param_groups[0]['lr']
                     print(f"Epoch {epoch:03d} [{step:5d}/{steps_total:5d}] "
-                          f"loss {avg:.6f} | {step_rate:.1f} it/s | ETA {eta_min:.1f} min")
+                          f"loss {avg:.6f} | {step_rate:.1f} it/s | ETA {eta_min:.1f} min | lr {cur_lr:.2e}")
+
+        # Step scheduler per-epoch
+        if scheduler is not None:
+            scheduler.step()
 
         # Evaluate periodically
         do_eval = (epoch % args.eval_every == 0) or (epoch == args.epochs)
         if do_eval:
             model.eval()
+
+            # swap in EMA weights for eval if requested
+            using_ema_now = False
+            if ema is not None and args.eval_use_ema:
+                ema.apply_shadow(model)
+                using_ema_now = True
+
             tot_loss = torch.tensor([0.0], device=device); tot_n = torch.tensor([0.0], device=device)
-            evm_pct_s = torch.tensor([0.0], device=device)
-            evm_db_s  = torch.tensor([0.0], device=device)
+            evm_u_pct_s = torch.tensor([0.0], device=device); evm_u_db_s = torch.tensor([0.0], device=device)
+            evm_a_pct_s = torch.tensor([0.0], device=device); evm_a_db_s = torch.tensor([0.0], device=device)
             snr_in_s  = torch.tensor([0.0], device=device)
             snr_out_s = torch.tensor([0.0], device=device)
             cnt       = torch.tensor([0.0], device=device)
+            snr_out_evm_al_s = torch.tensor([0.0], device=device)
 
             with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
                 for x, y in dl_va:
@@ -634,59 +754,95 @@ def train(args):
                     yhat = model(xin)
                     l = loss_fn(yhat, y)
 
-                    # accumulate
                     tot_loss += l.detach()
-                    tot_n    += torch.tensor([x.size(0)], device=device, dtype=torch.float32)
-                    evm_pct, evm_db = evm_pct_and_db(y, yhat)
+                    B = torch.tensor([float(x.size(0))], device=device)
+                    tot_n    += B
+
+                    # metrics
+                    evm_u_pct, evm_u_db = evm_unaligned(y, yhat)
+                    evm_a_pct, evm_a_db = evm_aligned(y, yhat, do_timing=args.align_eval, maxlag=64)
                     snr_in, snr_out = snr_db(y, yhat, x)
-                    evm_pct_s += evm_pct.detach().sum()
-                    evm_db_s  += evm_db.detach().sum()
-                    snr_in_s  += snr_in.detach()
-                    snr_out_s += snr_out.detach()
-                    cnt       += torch.tensor([float(x.size(0))], device=device)
+
+                    evm_u_pct_s += evm_u_pct.detach().sum()
+                    evm_u_db_s  += evm_u_db.detach().sum()
+                    evm_a_pct_s += evm_a_pct.detach().sum()
+                    evm_a_db_s  += evm_a_db.detach().sum()
+                    snr_in_s    += snr_in.detach()  * B
+                    snr_out_s   += snr_out.detach() * B
+
+                    snr_out_evm_al_s += (-20.0 * torch.log10((evm_a_pct / 100.0).clamp_min(1e-12))).detach().sum()
+                    cnt       += B
+
+            # restore raw weights if we swapped to EMA
+            if using_ema_now and ema is not None:
+                ema.restore(model)
 
             # reduce across ranks
-            for t in (tot_loss, tot_n, evm_pct_s, evm_db_s, snr_in_s, snr_out_s, cnt):
+            for t in (tot_loss, tot_n, evm_u_pct_s, evm_u_db_s, evm_a_pct_s, evm_a_db_s,
+                      snr_in_s, snr_out_s, snr_out_evm_al_s, cnt):
                 ddp_all_reduce_(t, op=dist.ReduceOp.SUM)
 
             if rank == 0:
-                val_loss = (tot_loss / torch.clamp_min(tot_n, 1.0)).item()
-                evm_pct_m = (evm_pct_s / torch.clamp_min(cnt, 1.0)).item()
-                evm_db_m  = (evm_db_s  / torch.clamp_min(cnt, 1.0)).item()
-                snr_in_m  = (snr_in_s  / torch.clamp_min(torch.tensor([world_size], device=device, dtype=torch.float32), 1.0)).item()
-                snr_out_m = (snr_out_s / torch.clamp_min(torch.tensor([world_size], device=device, dtype=torch.float32), 1.0)).item()
+                val_loss  = (tot_loss / torch.clamp_min(tot_n, 1.0)).item()
+                evm_u_pct_m = (evm_u_pct_s / torch.clamp_min(cnt, 1.0)).item()
+                evm_u_db_m  = (evm_u_db_s  / torch.clamp_min(cnt, 1.0)).item()
+                evm_a_pct_m = (evm_a_pct_s / torch.clamp_min(cnt, 1.0)).item()
+                evm_a_db_m  = (evm_a_db_s  / torch.clamp_min(cnt, 1.0)).item()
+                snr_in_m  = (snr_in_s  / torch.clamp_min(cnt, 1.0)).item()
+                snr_out_m = (snr_out_s / torch.clamp_min(cnt, 1.0)).item()
+                snr_out_evm_al_m = (snr_out_evm_al_s / torch.clamp_min(cnt, 1.0)).item()
 
                 dt_min = (time.time() - t0) / 60.0
                 train_loss_avg = run_loss_sum / max(1, run_loss_cnt)
-                print(f"Epoch {epoch:03d} | train {train_loss_avg:.6f} | val {val_loss:.6f} | "
-                      f"EVM {evm_pct_m:.2f}% ({evm_db_m:.2f} dB) | "
-                      f"SNR_in {snr_in_m:.2f} → SNR_out {snr_out_m:.2f} | {dt_min:.2f} min")
+                warn = " ⚠" if abs(snr_out_m - snr_out_evm_al_m) > 0.5 else ""
+                cur_lr = opt.param_groups[0]['lr']
+                print(
+                    f"Epoch {epoch:03d} | train {train_loss_avg:.6f} | val {val_loss:.6f} | "
+                    f"EVM {evm_u_pct_m:.2f}% ({evm_u_db_m:.2f} dB) | "
+                    f"EVM* {evm_a_pct_m:.2f}% ({evm_a_db_m:.2f} dB) | "
+                    f"SNR_in {snr_in_m:.2f} → SNR_out {snr_out_m:.2f} "
+                    f"[SNR_out(EVM*) {snr_out_evm_al_m:.2f}]{warn} | {dt_min:.2f} min | lr {cur_lr:.2e}"
+                )
 
-                # CSV row
                 if args.log_csv:
                     with open(args.log_csv, "a", newline="") as f:
                         w = csv.writer(f)
-                        w.writerow([epoch, f"{train_loss_avg:.6f}", f"{val_loss:.6f}",
-                                    f"{evm_pct_m:.4f}", f"{evm_db_m:.4f}",
-                                    f"{snr_in_m:.4f}", f"{snr_out_m:.4f}", f"{dt_min:.4f}"])
+                        w.writerow([
+                            epoch,
+                            f"{train_loss_avg:.6f}", f"{val_loss:.6f}",
+                            f"{evm_u_pct_m:.6f}", f"{evm_u_db_m:.6f}",
+                            f"{evm_a_pct_m:.6f}", f"{evm_a_db_m:.6f}",
+                            f"{snr_in_m:.6f}", f"{snr_out_m:.6f}", f"{snr_out_evm_al_m:.6f}",
+                            f"{dt_min:.6f}", f"{cur_lr:.8f}"
+                        ])
 
                 # Save best
                 if val_loss < best_val:
                     best_val = val_loss
                     outp = Path(args.out); outp.parent.mkdir(parents=True, exist_ok=True)
-                    ckpt = {"model": (model.module.state_dict() if use_ddp else model.state_dict()),
-                            "args": vars(args)}
+                    raw_sd = (model.module.state_dict() if use_ddp else model.state_dict())
+                    ckpt = {"model": raw_sd, "args": vars(args)}
                     torch.save(ckpt, str(outp))
-                    print(f"  ↳ saved best -> {outp}")
+                    print(f"  ↳ saved best (raw) -> {outp}")
+                    if ema is not None and args.save_ema:
+                        ckpt_ema = {"model": ema.state_dict(), "args": vars(args), "ema": True}
+                        outp_ema = outp.with_name(outp.stem + "_ema.pt")
+                        torch.save(ckpt_ema, str(outp_ema))
+                        print(f"  ↳ saved best (EMA) -> {outp_ema}")
 
         # Periodic checkpoint even if not best
         if rank == 0 and args.save_every > 0 and (epoch % args.save_every == 0):
             outp = Path(args.out)
             ckpt_path = outp.with_name(outp.stem + f"_epoch{epoch}.pt")
-            ckpt = {"model": (model.module.state_dict() if use_ddp else model.state_dict()),
-                    "args": vars(args)}
+            raw_sd = (model.module.state_dict() if use_ddp else model.state_dict())
+            ckpt = {"model": raw_sd, "args": vars(args)}
             torch.save(ckpt, str(ckpt_path))
-            print(f"  ↳ checkpoint -> {ckpt_path}")
+            print(f"  ↳ checkpoint (raw) -> {ckpt_path}")
+            if ema is not None and args.save_ema:
+                ckpt_ema = {"model": ema.state_dict(), "args": vars(args), "ema": True}
+                ckpt_path_ema = outp.with_name(outp.stem + f"_epoch{epoch}_ema.pt")
+                torch.save(ckpt_ema, str(ckpt_path_ema))
+                print(f"  ↳ checkpoint (EMA) -> {ckpt_path_ema}")
 
     # Wrap up
     if dist.is_initialized():
@@ -715,11 +871,19 @@ def build_argparser():
     ap.add_argument("--kernel", type=int, default=7, help="Kernel size")
     # Optim / schedule
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--min-lr", type=float, default=1e-6, help="Minimum LR at cosine floor")
+    ap.add_argument("--sched", type=str, default="none", choices=["none","cosine"], help="LR schedule")
+    ap.add_argument("--warmup-epochs", type=int, default=0, help="Linear warmup epochs before cosine")
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--amp", action="store_true", help="Enable mixed precision")
     ap.add_argument("--cpu", action="store_true", help="Force CPU")
     ap.add_argument("--seed", type=int, default=0)
+    # EMA
+    ap.add_argument("--ema", action="store_true", help="Track EMA of model weights")
+    ap.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay (e.g., 0.999)")
+    ap.add_argument("--eval-use-ema", action="store_true", help="Use EMA weights during validation")
+    ap.add_argument("--save-ema", action="store_true", help="Also save EMA weights alongside raw")
     # IO
     ap.add_argument("--out", type=str, default="tcn_denoiser.pt", help="Where to save best checkpoint")
     ap.add_argument("--save-every", type=int, default=0, help="Save an extra checkpoint every N epochs (0=off)")
@@ -744,6 +908,8 @@ def build_argparser():
     ap.add_argument("--spec-w-out", type=float, default=1.0)
     ap.add_argument("--smooth-weight", type=float, default=0.0, help="Weight of time-smoothness loss")
     ap.add_argument("--evm-norm-weight", type=float, default=0.2, help="Weight of mean(EVM%)/100")
+    # Eval alignment
+    ap.add_argument("--align-eval", action="store_true", help="Align timing + complex scale/phase for eval metrics")
 
     return ap
 
@@ -752,7 +918,6 @@ def main():
     args = ap.parse_args()
 
     # alias compatible names → attributes used in code
-    # (support kebab args converted by argparse to underscores)
     args.spec_w_in    = getattr(args, "spec_w_in")
     args.spec_w_guard = getattr(args, "spec_w_guard")
     args.spec_w_out   = getattr(args, "spec_w_out")
