@@ -1,0 +1,82 @@
+# scripts/03_plotting.py
+import sys
+from pathlib import Path
+
+# Get the project root directory
+script_dir = Path(__file__).resolve().parent  # scripts/
+project_root = script_dir.parent              # myproject/
+
+# Add to Python's search path
+sys.path.insert(0, str(project_root))
+# config/plot_config.py
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Color palettes for different use cases
+COLORS = {
+    'primary': '#2E86AB',
+    'secondary': '#A23B72',
+    'accent': '#F18F01',
+    'success': '#06A77D',
+    'warning': '#F77F00',
+    'danger': '#D62828'
+}
+
+CATEGORICAL_PALETTE = ['#2E86AB', '#A23B72', '#F18F01', '#06A77D', '#8338EC', '#FF006E']
+
+def set_plot_style(style='whitegrid', context='notebook'):
+    """
+    Set consistent plotting style
+    
+    Args:
+        style: seaborn style ('whitegrid', 'darkgrid', 'white', 'dark', 'ticks')
+        context: seaborn context ('paper', 'notebook', 'talk', 'poster')
+    """
+    sns.set_style(style)
+    sns.set_context(context)
+    
+    # Custom rcParams
+    plt.rcParams.update({
+        'figure.figsize': (10, 6),
+        'figure.dpi': 100,  # Screen display
+        'savefig.dpi': 300,  # High-res saving
+        'font.size': 11,
+        'axes.labelsize': 12,
+        'axes.titlesize': 14,
+        'axes.titleweight': 'bold',
+        'xtick.labelsize': 10,
+        'ytick.labelsize': 10,
+        'legend.fontsize': 10,
+        'legend.frameon': True,
+        'legend.shadow': True,
+        'axes.spines.top': False,
+        'axes.spines.right': False,
+        'axes.grid': True,
+        'grid.alpha': 0.3,
+    })
+    
+    # Set color palette
+    sns.set_palette(CATEGORICAL_PALETTE)
+
+def save_figure(fig, filename, formats=['png', 'pdf']):
+    """
+    Save figure in multiple formats with consistent settings
+    
+    Args:
+        fig: matplotlib figure object
+        filename: base filename without extension
+        formats: list of formats to save
+    """
+    for fmt in formats:
+        fig.savefig(
+            f'figures/{filename}.{fmt}',
+            dpi=300,
+            bbox_inches='tight',
+            facecolor='white',
+            edgecolor='none'
+        )
+    print(f"✓ Saved {filename} as {', '.join(formats)}")
+
+def get_color(name):
+    """Get a color from the palette"""
+    return COLORS.get(name, COLORS['primary'])
