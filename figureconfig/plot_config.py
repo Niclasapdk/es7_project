@@ -22,7 +22,7 @@ COLORS = {
     'danger': '#D62828'
 }
 
-CATEGORICAL_PALETTE = ['#2E86AB', '#A23B72', '#F18F01', '#06A77D', '#8338EC', '#FF006E']
+CATEGORICAL_PALETTE = ["#3D09F8", '#A23B72', '#F18F01', '#06A77D', '#8338EC', '#FF006E']
 
 def set_plot_style(style='whitegrid', context='notebook'):
     """
@@ -40,19 +40,22 @@ def set_plot_style(style='whitegrid', context='notebook'):
         'figure.figsize': (10, 6),
         'figure.dpi': 100,  # Screen display
         'savefig.dpi': 300,  # High-res saving
-        'font.size': 11,
-        'axes.labelsize': 12,
-        'axes.titlesize': 14,
+        'font.size': 18,
+        'axes.labelsize': 20,
+        'axes.titlesize': 24,
         'axes.titleweight': 'bold',
-        'xtick.labelsize': 10,
-        'ytick.labelsize': 10,
-        'legend.fontsize': 10,
+        'xtick.labelsize': 16,
+        'ytick.labelsize': 16,
+        'legend.fontsize': 16,
         'legend.frameon': True,
         'legend.shadow': True,
         'axes.spines.top': False,
         'axes.spines.right': False,
         'axes.grid': True,
-        'grid.alpha': 0.3,
+        'grid.color': '#000000',
+        'grid.alpha': 1.0,
+        'grid.linewidth': 1.0,
+        'grid.linestyle': '-',
     })
     
     # Set color palette
