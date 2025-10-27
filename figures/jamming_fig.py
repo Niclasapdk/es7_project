@@ -119,3 +119,64 @@ axBarrage.grid(True, alpha=0.3, linestyle='--')
 handles, labels = axBarrage.get_legend_handles_labels()
 axBarrage.legend(loc='upper right', framealpha=0.7)
 save_figure(figBarrage, 'jamming_gps_barrage', formats=['png'])
+
+
+# for chirp instead
+
+bandsChirp = {
+    'Chirp': {'start': 1176.0, 'end': 1180.0, 'center': 1178.0},
+    'L1': {'start': 1166.22, 'end': 1186.68, 'center': 1176.45},
+    'L2': {'start': 1217.37, 'end': 1237.83, 'center': 1227.60},
+}
+
+# Sample PSD values for each band (you can replace these with your actual data)
+psd_values = {
+    'L1': 21.5,  # dBm/Hz or your unit
+    'L2': 21.5,
+    'Chirp': 35 
+}
+figChirp, axChirp = plt.subplots()
+
+num_chirps = 3
+chirp_spacing = 25 
+
+colors = [get_color('first'), get_color('second'), get_color('third'), get_color('fourth')]
+for idx, (band_name, band_info) in enumerate(bandsChirp.items()):
+    psd = psd_values[band_name]
+    width = band_info['end'] - band_info['start']
+    center = band_info['center']
+    height = psd_values[band_name]
+    if band_name == "Chirp":
+        for i in range(num_chirps):
+            center = band_info['start'] + width/2 + (i * chirp_spacing)
+            label = f'1st {band_name} ({band_info["start"]:.2f}-{band_info["end"]:.2f} MHz), {(-180 + psd)} dBW' if i == 0 else None
+            axChirp.bar(center, height, width=width, 
+                   color=colors[idx], alpha=0.7, 
+                   edgecolor='black', linewidth=1.5,
+                   label=label, bottom=-180)
+    else:
+        axChirp.bar(center, height, width=width, 
+               color=colors[idx], alpha=0.7, 
+               edgecolor='black', linewidth=1.5,
+               label=f'{band_name} ({band_info["start"]:.2f}-{band_info["end"]:.2f} MHz), {(-180 + psd)} dBW', bottom = -180)
+bottom_offset = -180
+
+axChirp.text(bandsChirp['L1']['center'], bottom_offset + psd_values['L1']/2, 'L1',
+        ha='center', va='center', fontweight='bold', color='white')
+
+axChirp.text(bandsChirp['L2']['center'], bottom_offset + psd_values['L2']/2, 'L2',
+        ha='center', va='center', fontweight='bold', color='white')
+
+axChirp.set_xlabel('Frequency (MHz)')
+axChirp.set_ylabel('PSD (dBW/Hz)')
+axChirp.set_title('Chirp Jamming in GPS Band')
+axChirp.set_xticks(np.arange(1160, 1250, 20))  # Ticks every 50 MHz
+axChirp.set_ylim(-180, -130)  # Adjust based on your data
+
+# Add grid
+axChirp.grid(True, alpha=0.3, linestyle='--')
+
+# Legend
+handles, labels = axChirp.get_legend_handles_labels()
+axChirp.legend(loc='upper right', framealpha=0.7)
+save_figure(figChirp, 'jamming_gps_chirp', formats=['png'])
