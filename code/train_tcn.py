@@ -2,11 +2,15 @@
 """
 train_tcn.py — Causal TCN denoiser for baseband IQ with optional DSP prefilter.
 
-Additions in this build
+This build adds:
 - Aligned & unaligned EVM metrics (timing + complex LS scale/phase)
-- EMA weights (--ema, --ema-decay, --eval-use-ema, --save-ema)
-- Cosine LR scheduler with optional warmup (--sched cosine, --warmup-epochs, --min-lr)
-- CSV logs include both aligned & unaligned EVM + SNR_out(EVM_aligned)
+- Prints BOTH SNR_out (raw) and SNR_out(EVM*) (aligned). You can flip the headline via --headline {raw,aligned}.
+- Residual application is consistent: yhat = base + core in BOTH train and eval.
+- Step-0 baseline eval with --eval-first (before any updates).
+- Optional "identity" eval with --freeze-core-eval (sets core=0 -> yhat=base) to show SNR_in/EVM identity baseline.
+- Optional alignment stats via --print-align-stats (avg gain and phase from LS alignment).
+- Optional small phase/gain regularizers during training (--phase-pen, --gain-pen) to lift raw SNR toward aligned SNR.
+- Configurable checkpoint selection via --select-metric {val_loss,evm,evm_star,snr_out,snr_out_star}.
 """
 
 from __future__ import annotations
@@ -22,9 +26,8 @@ from torch import amp
 from torch.utils.data import Dataset, DataLoader
 import torch.distributed as dist
 
-# Use TF32 on Ampere+ where available
+# Prefer TF32 on Ampere+
 torch.set_float32_matmul_precision("high")
-
 warnings.filterwarnings("ignore", message="The pynvml package is deprecated")
 
 # ---------------------------
@@ -54,7 +57,7 @@ def ddp_all_reduce_(t: torch.Tensor, op=dist.ReduceOp.SUM):
 
 # ---------------------------
 # IQ / complex utilities
-# ---------------------------                                           # back to [B,T,2]
+# ---------------------------
 
 def _ensure_iq_last_contig(x: torch.Tensor) -> torch.Tensor:
     if x.ndim >= 3 and x.shape[-1] != 2 and x.shape[1] == 2:
@@ -377,8 +380,8 @@ def spectral_loss(y_true, y_pred, fs, inband, guard, w_in=1.0, w_guard=1.0, w_ou
     yp = y_pred if torch.is_complex(y_pred) else complex_from_iq(y_pred)
     assert yt.ndim == 2 and yp.ndim == 2, f"Expected (B,T) complex tensors, got {yt.shape}, {yp.shape}"
     B, T = yt.shape
-    YT = torch.fft.fft(yt, n=T, dim=1)
-    YP = torch.fft.fft(yp, n=T, dim=1)
+    YT = torch.fft.fft(yt, n=T, dim=1, norm='ortho')
+    YP = torch.fft.fft(yp, n=T, dim=1, norm='ortho')
     freqs = torch.fft.fftfreq(T, d=1.0 / fs).to(yt.device)
     pos = freqs >= 0
     freqs = freqs[pos]; YT = YT[:, pos]; YP = YP[:, pos]
@@ -406,11 +409,6 @@ def first_diff_loss(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def _best_lag(y: torch.Tensor, yhat: torch.Tensor, maxlag: int = 64) -> Tuple[torch.Tensor, int]:
-    """
-    Crude per-batch timing alignment via cross-correlation (complex).
-    y, yhat: (B,T) complex
-    Returns yhat_shifted, chosen_lag (int for info only; if varying per-batch, returns 0)
-    """
     B, T = y.shape
     Y = torch.fft.fft(y, n=T, dim=1)
     H = torch.fft.fft(yhat, n=T, dim=1)
@@ -422,7 +420,6 @@ def _best_lag(y: torch.Tensor, yhat: torch.Tensor, maxlag: int = 64) -> Tuple[to
     lagsw = lags[m]
     peak_idx = torch.argmax(ccw.abs(), dim=1)
     best_lags = lagsw[peak_idx]  # (B,)
-    # shift each batch separately along time dim
     yhat_s = torch.empty_like(yhat)
     for b, sft in enumerate(best_lags.tolist()):
         yhat_s[b] = torch.roll(yhat[b], shifts=int(sft), dims=0)
@@ -430,13 +427,9 @@ def _best_lag(y: torch.Tensor, yhat: torch.Tensor, maxlag: int = 64) -> Tuple[to
     return yhat_s, int(best_lags[0].item()) if same else 0
 
 def _ls_align(y: torch.Tensor, yhat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Differentiable complex LS align: alpha = <yhat,y> / <yhat,yhat>.
-    y, yhat: (B,T) complex. Returns (aligned_yhat, alpha).
-    """
     num = torch.sum(torch.conj(yhat) * y, dim=1)        # (B,)
     den = torch.sum(torch.conj(yhat) * yhat, dim=1)
-    den = den.real.clamp_min(1e-12)                     # keep real, avoid div-by-zero
+    den = den.real.clamp_min(1e-12)
     alpha = num / den                                   # (B,)
     yhat_al = alpha[:, None] * yhat
     return yhat_al, alpha
@@ -464,7 +457,7 @@ def evm_aligned(y_true, y_pred, do_timing: bool = True, maxlag: int = 64):
     evm_rms = torch.sqrt(err_pow / ref_pow)
     evm_pct = 100.0 * evm_rms
     evm_db  = 20.0 * torch.log10(evm_rms.clamp_min(1e-12))
-    return evm_pct, evm_db
+    return evm_pct, evm_db, alpha
 
 @torch.no_grad()
 def snr_db(y_true, y_pred, x_in, eps: float = 1e-12):
@@ -478,6 +471,19 @@ def snr_db(y_true, y_pred, x_in, eps: float = 1e-12):
     snr_out = 10.0 * torch.log10((s / n_out).clamp_min(eps))
     return snr_in.mean(), snr_out.mean()
 
+def phase_gain_penalty(yhat: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor]:
+    yh = complex_from_iq(_ensure_iq_last_contig(yhat))
+    yt = complex_from_iq(_ensure_iq_last_contig(y))
+    num = torch.sum(torch.conj(yt) * yh, dim=1)
+    den = (torch.sqrt(torch.sum(torch.abs(yt)**2, dim=1).clamp_min(eps)) *
+           torch.sqrt(torch.sum(torch.abs(yh)**2, dim=1).clamp_min(eps)))
+    rho = num / (den + eps)
+    phase_pen = (1.0 - rho.real.clamp(min=-1.0, max=1.0)).mean()
+    pow_y  = torch.sum(torch.abs(yt)**2, dim=1).clamp_min(eps)
+    pow_yh = torch.sum(torch.abs(yh)**2, dim=1).clamp_min(eps)
+    gain_pen = (((torch.sqrt(pow_yh) - torch.sqrt(pow_y))**2) / pow_y).mean()
+    return phase_pen, gain_pen
+
 class CompositeLoss(nn.Module):
     def __init__(self, fs: float, inband_hz, guard_hz,
                  spec_weight: float, w_in: float, w_guard: float, w_out: float,
@@ -486,28 +492,34 @@ class CompositeLoss(nn.Module):
         self.fs = fs; self.inband = inband_hz; self.guard = guard_hz
         self.spec_weight = spec_weight
         self.w_in = w_in; self.w_guard = w_guard; self.w_out = w_out
-        self.smooth_weight = smooth_weight
-        self.evm_norm_weight = evm_norm_weight
+        self.smooth_weight = smooth_weight; self.evm_norm_weight = evm_norm_weight
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        # complex views
+        # inside CompositeLoss.forward(...)
         yt = complex_from_iq(_ensure_iq_last_contig(y_true))
         yp = complex_from_iq(_ensure_iq_last_contig(y_pred))
-        # align (grad-enabled)
         yp_al, _ = _ls_align(yt, yp)
         y_pred_al = iq_from_complex(yp_al)
 
-        l_time   = F.l1_loss(y_pred_al, y_true)
+        l_time_aligned = F.l1_loss(y_pred_al, y_true)
+        l_time_raw     = F.l1_loss(y_pred,    y_true)  # NEW
+
+        # keep spectral & smooth on aligned for robustness
         l_spec   = spectral_loss(y_true, y_pred_al, self.fs, self.inband, self.guard,
                                 self.w_in, self.w_guard, self.w_out)
         l_smooth = first_diff_loss(y_true, y_pred_al)
 
-        # optional EVM-normalization term as a CONSTANT (no grads needed)
         with torch.no_grad():
             evm_pct, _ = evm_unaligned(y_true, y_pred_al)
             l_evmn = (evm_pct / 100.0).mean()
 
-        return l_time + self.spec_weight * l_spec + self.smooth_weight * l_smooth + self.evm_norm_weight * l_evmn
+        alpha_raw_anchor = 0.1  # e.g., expose as --raw-anchor
+        return (l_time_aligned
+                + alpha_raw_anchor * l_time_raw
+                + self.spec_weight * l_spec
+                + self.smooth_weight * l_smooth
+                + self.evm_norm_weight * l_evmn)
+
 
 # ---------------------------
 # EMA utils
@@ -580,6 +592,135 @@ def build_scheduler(optimizer, sched: str, base_lr: float, epochs: int, warmup_e
 def make_model(in_ch: int, ch: int, k: int, n_blocks: int, device):
     return TCN(in_ch=in_ch, ch=ch, k=k, n_blocks=n_blocks, out_ch=2).to(device)
 
+def _eval_once(args, model, device, dl_va, loss_fn, use_amp, ema, rank, epoch, train_loss_avg=None, cur_lr=0.0, label="Epoch"):
+    use_ddp = dist.is_initialized()
+    # swap in EMA weights for eval if requested
+    using_ema_now = False
+    if ema is not None and args.eval_use_ema:
+        ema.apply_shadow(model)
+        using_ema_now = True
+
+    tot_loss = torch.tensor([0.0], device=device); tot_n = torch.tensor([0.0], device=device)
+    evm_u_pct_s = torch.tensor([0.0], device=device); evm_u_db_s = torch.tensor([0.0], device=device)
+    evm_a_pct_s = torch.tensor([0.0], device=device); evm_a_db_s = torch.tensor([0.0], device=device)
+    snr_in_s  = torch.tensor([0.0], device=device)
+    snr_out_s = torch.tensor([0.0], device=device)
+    snr_out_evm_al_s = torch.tensor([0.0], device=device)
+    cnt       = torch.tensor([0.0], device=device)
+    # alignment stats
+    al_gain_s = torch.tensor([0.0], device=device)
+    al_phase_s= torch.tensor([0.0], device=device)
+
+    with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
+        for x, y in dl_va:
+            x = x.to(device, non_blocking=True); y = y.to(device, non_blocking=True)
+            if args.prefilter != "none" or args.input_mode != "raw":
+                dsp_x = apply_prefilter(x, args.fs, args.prefilter, args.inband_hz, args.guard_hz,
+                                        args.prefilter_max_depth_out_db, args.prefilter_max_depth_in_db)
+            else:
+                dsp_x = x
+
+            if args.input_mode == "raw":
+                xin = x
+            elif args.input_mode == "dsp":
+                xin = dsp_x
+            else:
+                xin = torch.cat([x, dsp_x], dim=-1)
+
+            core = model(xin)
+            # choose identity base exactly as in training
+            if args.input_mode == "raw":
+                base = x
+            elif args.input_mode == "dsp":
+                base = dsp_x
+            else:  # dualpath
+                base = x
+
+            if args.freeze_core_eval:
+                yhat = base  # identity baseline
+            else:
+                yhat = base + core
+
+            l = loss_fn(yhat, y)
+
+            B = torch.tensor([float(x.size(0))], device=device)
+            tot_loss += l.detach() * B
+            tot_n    += B
+
+            # metrics
+            evm_u_pct, evm_u_db = evm_unaligned(y, yhat)
+            evm_a_pct, evm_a_db, alpha = evm_aligned(y, yhat, do_timing=args.align_eval, maxlag=args.maxlag)
+            snr_in, snr_out = snr_db(y, yhat, base)
+
+            evm_u_pct_s += evm_u_pct.detach().sum()
+            evm_u_db_s  += evm_u_db.detach().sum()
+            evm_a_pct_s += evm_a_pct.detach().sum()
+            evm_a_db_s  += evm_a_db.detach().sum()
+            snr_in_s    += snr_in.detach()  * B
+            snr_out_s   += snr_out.detach() * B
+            snr_out_evm_al_s += (-20.0 * torch.log10((evm_a_pct / 100.0).clamp_min(1e-12))).detach().sum()
+            cnt       += B
+
+            if args.print_align_stats:
+                al_gain_s  += torch.abs(alpha).detach().sum()
+                al_phase_s += torch.angle(alpha).detach().sum()
+
+    # restore raw weights if we swapped to EMA
+    if using_ema_now and ema is not None:
+        ema.restore(model)
+
+    # reduce across ranks
+    for t in (tot_loss, tot_n, evm_u_pct_s, evm_u_db_s, evm_a_pct_s, evm_a_db_s,
+              snr_in_s, snr_out_s, snr_out_evm_al_s, cnt, al_gain_s, al_phase_s):
+        ddp_all_reduce_(t, op=dist.ReduceOp.SUM)
+
+    if rank == 0:
+        val_loss  = (tot_loss / torch.clamp_min(tot_n, 1.0)).item()
+        evm_u_pct_m = (evm_u_pct_s / torch.clamp_min(cnt, 1.0)).item()
+        evm_u_db_m  = (evm_u_db_s  / torch.clamp_min(cnt, 1.0)).item()
+        evm_a_pct_m = (evm_a_pct_s / torch.clamp_min(cnt, 1.0)).item()
+        evm_a_db_m  = (evm_a_db_s  / torch.clamp_min(cnt, 1.0)).item()
+        snr_in_m  = (snr_in_s  / torch.clamp_min(cnt, 1.0)).item()
+        snr_out_m = (snr_out_s / torch.clamp_min(cnt, 1.0)).item()
+        snr_out_evm_al_m = (snr_out_evm_al_s / torch.clamp_min(cnt, 1.0)).item()
+        gain_avg = (al_gain_s / torch.clamp_min(cnt, 1.0)).item()
+        phase_avg = (al_phase_s / torch.clamp_min(cnt, 1.0)).item() * (180.0 / math.pi)
+
+        # headline selection
+        if args.headline == "aligned":
+            snr_main = snr_out_evm_al_m; snr_br = snr_out_m
+            evm_main_pct, evm_main_db = evm_a_pct_m, evm_a_db_m
+            evm_br_pct,   evm_br_db   = evm_u_pct_m, evm_u_db_m
+            tag_br = "raw"; tag_main = "EVM*"
+        else:
+            snr_main = snr_out_m; snr_br = snr_out_evm_al_m
+            evm_main_pct, evm_main_db = evm_u_pct_m, evm_u_db_m
+            evm_br_pct,   evm_br_db   = evm_a_pct_m, evm_a_db_m
+            tag_br = "EVM*"; tag_main = "raw"
+
+        warn = " ⚠" if abs(snr_out_m - snr_out_evm_al_m) > 0.5 else ""
+        if train_loss_avg is None:
+            train_str = ""
+        else:
+            train_str = f" | train {train_loss_avg:.6f}"
+
+        msg = (f"{label} {epoch:03d}{train_str} | val {val_loss:.6f} | "
+               f"EVM {evm_main_pct:.2f}% ({evm_main_db:.2f} dB, {tag_main}) | "
+               f"EVM* {evm_br_pct:.2f}% ({evm_br_db:.2f} dB, {tag_br}) | "
+               f"SNR_in {snr_in_m:.2f} → SNR_out {snr_main:.2f} "
+               f"[SNR_out({tag_br}) {snr_br:.2f}]{warn}")
+        print(msg)
+        if args.print_align_stats:
+            print(f"   ↳ align stats: avg |alpha|≈{gain_avg:.3f}, avg ∠alpha≈{phase_avg:+.1f}°")
+
+    return {
+        "val_loss": float((tot_loss / torch.clamp_min(tot_n, 1.0)).item()),
+        "evm":      float((evm_u_pct_s / torch.clamp_min(cnt, 1.0)).item()),
+        "evm_star": float((evm_a_pct_s / torch.clamp_min(cnt, 1.0)).item()),
+        "snr_out":  float((snr_out_s / torch.clamp_min(cnt, 1.0)).item()),
+        "snr_out_star": float((snr_out_evm_al_s / torch.clamp_min(cnt, 1.0)).item()),
+    }
+
 def train(args):
     world_size, rank, local_rank = ddp_init_if_needed(backend="gloo" if args.cpu else "nccl")
     use_ddp = world_size > 1
@@ -614,9 +755,7 @@ def train(args):
     scaler  = amp.GradScaler('cuda', enabled=use_amp)
 
     # EMA
-    ema: Optional[EMA] = None
-    if args.ema:
-        ema = EMA(model, decay=args.ema_decay)
+    ema: Optional[EMA] = EMA(model, decay=args.ema_decay) if args.ema else None
 
     # Scheduler
     scheduler = build_scheduler(opt, args.sched, args.lr, args.epochs, args.warmup_epochs, args.min_lr)
@@ -638,8 +777,14 @@ def train(args):
                             "evm_align_pct","evm_align_db",
                             "snr_in","snr_out","snr_out_evm_aligned","minutes","lr"])
 
-    best_val = float("inf")
-    global_step = 0
+    # ---- Step-0 baseline eval (optional) ----
+    if args.eval_first:
+        _ = _eval_once(args, model, device, dl_va, loss_fn, use_amp, ema=None, rank=rank,
+                       epoch=0, train_loss_avg=None, cur_lr=opt.param_groups[0]['lr'], label="BASELINE")
+
+    # Training
+    best_score = None
+    best_is_higher_better = args.select_metric in {"snr_out", "snr_out_star"}
 
     for epoch in range(1, args.epochs + 1):
         if use_ddp and hasattr(dl_tr.sampler, "set_epoch"):
@@ -671,22 +816,23 @@ def train(args):
 
             opt.zero_grad(set_to_none=True)
             with amp.autocast('cuda', enabled=use_amp):
-                core = model(xin)  # model predicts the correction
-                # choose identity base:
+                core = model(xin)  # residual
                 if args.input_mode == "raw":
                     base = x
                 elif args.input_mode == "dsp":
                     base = dsp_x
-                elif args.input_mode == "dualpath":
-                    base = x  # identity to raw path
                 else:
-                    raise ValueError("invalid --input-mode")
-
+                    base = x
                 yhat = base + core
                 loss = loss_fn(yhat, y)
 
+                if args.phase_pen > 0.0 or args.gain_pen > 0.0:
+                    phase_pen, gain_pen = phase_gain_penalty(yhat, y)
+                    loss = loss + args.phase_pen * phase_pen + args.gain_pen * gain_pen
 
             scaler.scale(loss).backward()
+            if use_amp:
+                scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
@@ -697,7 +843,6 @@ def train(args):
             # stats
             loss_v = float(loss.detach().cpu())
             run_loss_sum += loss_v; run_loss_cnt += 1
-            global_step += 1
 
             # progress logging (rank 0 only)
             if rank == 0 and (args.progress or args.log_every > 0):
@@ -716,114 +861,26 @@ def train(args):
         if scheduler is not None:
             scheduler.step()
 
-        # Evaluate periodically
+        # Evaluate
         do_eval = (epoch % args.eval_every == 0) or (epoch == args.epochs)
         if do_eval:
             model.eval()
+            train_loss_avg = run_loss_sum / max(1, run_loss_cnt)
+            metrics = _eval_once(args, model, device, dl_va, loss_fn, use_amp, ema, rank, epoch,
+                                 train_loss_avg=train_loss_avg, cur_lr=opt.param_groups[0]['lr'], label="Epoch")
 
-            # swap in EMA weights for eval if requested
-            using_ema_now = False
-            if ema is not None and args.eval_use_ema:
-                ema.apply_shadow(model)
-                using_ema_now = True
-
-            tot_loss = torch.tensor([0.0], device=device); tot_n = torch.tensor([0.0], device=device)
-            evm_u_pct_s = torch.tensor([0.0], device=device); evm_u_db_s = torch.tensor([0.0], device=device)
-            evm_a_pct_s = torch.tensor([0.0], device=device); evm_a_db_s = torch.tensor([0.0], device=device)
-            snr_in_s  = torch.tensor([0.0], device=device)
-            snr_out_s = torch.tensor([0.0], device=device)
-            cnt       = torch.tensor([0.0], device=device)
-            snr_out_evm_al_s = torch.tensor([0.0], device=device)
-
-            with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
-                for x, y in dl_va:
-                    x = x.to(device, non_blocking=True); y = y.to(device, non_blocking=True)
-                    if args.prefilter != "none" or args.input_mode != "raw":
-                        dsp_x = apply_prefilter(x, args.fs, args.prefilter, args.inband_hz, args.guard_hz,
-                                                args.prefilter_max_depth_out_db, args.prefilter_max_depth_in_db)
-                    else:
-                        dsp_x = x
-
-                    if args.input_mode == "raw":
-                        xin = x
-                    elif args.input_mode == "dsp":
-                        xin = dsp_x
-                    else:
-                        xin = torch.cat([x, dsp_x], dim=-1)
-
-                    yhat = model(xin)
-                    l = loss_fn(yhat, y)
-
-                    tot_loss += l.detach()
-                    B = torch.tensor([float(x.size(0))], device=device)
-                    tot_n    += B
-
-                    # metrics
-                    evm_u_pct, evm_u_db = evm_unaligned(y, yhat)
-                    evm_a_pct, evm_a_db = evm_aligned(y, yhat, do_timing=args.align_eval, maxlag=64)
-                    snr_in, snr_out = snr_db(y, yhat, x)
-
-                    evm_u_pct_s += evm_u_pct.detach().sum()
-                    evm_u_db_s  += evm_u_db.detach().sum()
-                    evm_a_pct_s += evm_a_pct.detach().sum()
-                    evm_a_db_s  += evm_a_db.detach().sum()
-                    snr_in_s    += snr_in.detach()  * B
-                    snr_out_s   += snr_out.detach() * B
-
-                    snr_out_evm_al_s += (-20.0 * torch.log10((evm_a_pct / 100.0).clamp_min(1e-12))).detach().sum()
-                    cnt       += B
-
-            # restore raw weights if we swapped to EMA
-            if using_ema_now and ema is not None:
-                ema.restore(model)
-
-            # reduce across ranks
-            for t in (tot_loss, tot_n, evm_u_pct_s, evm_u_db_s, evm_a_pct_s, evm_a_db_s,
-                      snr_in_s, snr_out_s, snr_out_evm_al_s, cnt):
-                ddp_all_reduce_(t, op=dist.ReduceOp.SUM)
-
+            # checkpoint selection
             if rank == 0:
-                val_loss  = (tot_loss / torch.clamp_min(tot_n, 1.0)).item()
-                evm_u_pct_m = (evm_u_pct_s / torch.clamp_min(cnt, 1.0)).item()
-                evm_u_db_m  = (evm_u_db_s  / torch.clamp_min(cnt, 1.0)).item()
-                evm_a_pct_m = (evm_a_pct_s / torch.clamp_min(cnt, 1.0)).item()
-                evm_a_db_m  = (evm_a_db_s  / torch.clamp_min(cnt, 1.0)).item()
-                snr_in_m  = (snr_in_s  / torch.clamp_min(cnt, 1.0)).item()
-                snr_out_m = (snr_out_s / torch.clamp_min(cnt, 1.0)).item()
-                snr_out_evm_al_m = (snr_out_evm_al_s / torch.clamp_min(cnt, 1.0)).item()
-
-                dt_min = (time.time() - t0) / 60.0
-                train_loss_avg = run_loss_sum / max(1, run_loss_cnt)
-                warn = " ⚠" if abs(snr_out_m - snr_out_evm_al_m) > 0.5 else ""
-                cur_lr = opt.param_groups[0]['lr']
-                print(
-                    f"Epoch {epoch:03d} | train {train_loss_avg:.6f} | val {val_loss:.6f} | "
-                    f"EVM {evm_u_pct_m:.2f}% ({evm_u_db_m:.2f} dB) | "
-                    f"EVM* {evm_a_pct_m:.2f}% ({evm_a_db_m:.2f} dB) | "
-                    f"SNR_in {snr_in_m:.2f} → SNR_out {snr_out_m:.2f} "
-                    f"[SNR_out(EVM*) {snr_out_evm_al_m:.2f}]{warn} | {dt_min:.2f} min | lr {cur_lr:.2e}"
-                )
-
-                if args.log_csv:
-                    with open(args.log_csv, "a", newline="") as f:
-                        w = csv.writer(f)
-                        w.writerow([
-                            epoch,
-                            f"{train_loss_avg:.6f}", f"{val_loss:.6f}",
-                            f"{evm_u_pct_m:.6f}", f"{evm_u_db_m:.6f}",
-                            f"{evm_a_pct_m:.6f}", f"{evm_a_db_m:.6f}",
-                            f"{snr_in_m:.6f}", f"{snr_out_m:.6f}", f"{snr_out_evm_al_m:.6f}",
-                            f"{dt_min:.6f}", f"{cur_lr:.8f}"
-                        ])
-
-                # Save best
-                if val_loss < best_val:
-                    best_val = val_loss
+                cur = metrics[args.select_metric]
+                better = (best_score is None) or ((cur > best_score) if best_is_higher_better else (cur < best_score))
+                if better:
+                    best_score = cur
                     outp = Path(args.out); outp.parent.mkdir(parents=True, exist_ok=True)
+                    use_ddp = dist.is_initialized()
                     raw_sd = (model.module.state_dict() if use_ddp else model.state_dict())
                     ckpt = {"model": raw_sd, "args": vars(args)}
                     torch.save(ckpt, str(outp))
-                    print(f"  ↳ saved best (raw) -> {outp}")
+                    print(f"  ↳ saved best ({args.select_metric}={cur:.4f}) -> {outp}")
                     if ema is not None and args.save_ema:
                         ckpt_ema = {"model": ema.state_dict(), "args": vars(args), "ema": True}
                         outp_ema = outp.with_name(outp.stem + "_ema.pt")
@@ -834,6 +891,7 @@ def train(args):
         if rank == 0 and args.save_every > 0 and (epoch % args.save_every == 0):
             outp = Path(args.out)
             ckpt_path = outp.with_name(outp.stem + f"_epoch{epoch}.pt")
+            use_ddp = dist.is_initialized()
             raw_sd = (model.module.state_dict() if use_ddp else model.state_dict())
             ckpt = {"model": raw_sd, "args": vars(args)}
             torch.save(ckpt, str(ckpt_path))
@@ -842,7 +900,7 @@ def train(args):
                 ckpt_ema = {"model": ema.state_dict(), "args": vars(args), "ema": True}
                 ckpt_path_ema = outp.with_name(outp.stem + f"_epoch{epoch}_ema.pt")
                 torch.save(ckpt_ema, str(ckpt_path_ema))
-                print(f"  ↳ checkpoint (EMA) -> {ckpt_path_ema}")
+                print(f"  ↳ checkpoint (EMA) -> {ckpt_ema}")
 
     # Wrap up
     if dist.is_initialized():
@@ -910,6 +968,20 @@ def build_argparser():
     ap.add_argument("--evm-norm-weight", type=float, default=0.2, help="Weight of mean(EVM%)/100")
     # Eval alignment
     ap.add_argument("--align-eval", action="store_true", help="Align timing + complex scale/phase for eval metrics")
+    ap.add_argument("--maxlag", type=int, default=64, help="Max lag (samples) to search in timing alignment")
+    ap.add_argument("--headline", type=str, default="raw", choices=["raw","aligned"],
+                    help="Which metric to display as the headline SNR/EVM (raw vs EVM*-aligned)")
+    ap.add_argument("--eval-first", action="store_true", help="Run a baseline validation before any training")
+    ap.add_argument("--freeze-core-eval", action="store_true",
+                    help="During eval, set residual to zero (yhat=base) to show identity baseline")
+    ap.add_argument("--print-align-stats", action="store_true",
+                    help="Print average |alpha| and phase(deg) from LS alignment")
+    # Regularizers & selection
+    ap.add_argument("--phase-pen", type=float, default=0.0, help="Weight for phase alignment penalty (small, e.g., 0.05)")
+    ap.add_argument("--gain-pen", type=float, default=0.0, help="Weight for gain alignment penalty (small, e.g., 0.01)")
+    ap.add_argument("--select-metric", type=str, default="val_loss",
+                    choices=["val_loss","evm","evm_star","snr_out","snr_out_star"],
+                    help="Metric used to select 'best' checkpoint")
 
     return ap
 
