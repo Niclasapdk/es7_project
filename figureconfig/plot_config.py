@@ -14,12 +14,12 @@ import seaborn as sns
 
 # Color palettes for different use cases
 COLORS = {
-    'primary': '#2E86AB',
-    'secondary': '#A23B72',
-    'accent': '#F18F01',
-    'success': '#06A77D',
-    'warning': '#F77F00',
-    'danger': '#D62828'
+    'first': '#2E86AB',
+    'second': '#A23B72',
+    'third': '#F18F01',
+    'fourth': '#06A77D',
+    'fifth': '#F77F00',
+    'sixth': '#D62828'
 }
 
 CATEGORICAL_PALETTE = ["#3D09F8", '#A23B72', '#F18F01', '#06A77D', '#8338EC', '#FF006E']
@@ -37,7 +37,7 @@ def set_plot_style(style='whitegrid', context='notebook'):
     
     # Custom rcParams
     plt.rcParams.update({
-        'figure.figsize': (10, 6),
+        'figure.figsize': (16, 9),
         'figure.dpi': 100,  # Screen display
         'savefig.dpi': 300,  # High-res saving
         'font.size': 18,
@@ -48,7 +48,8 @@ def set_plot_style(style='whitegrid', context='notebook'):
         'ytick.labelsize': 16,
         'legend.fontsize': 16,
         'legend.frameon': True,
-        'legend.shadow': True,
+        'legend.shadow': False,
+        'legend.facecolor': '#FFFFFF',
         'axes.spines.top': False,
         'axes.spines.right': False,
         'axes.grid': True,
@@ -82,4 +83,4 @@ def save_figure(fig, filename, formats=['png', 'pdf']):
 
 def get_color(name):
     """Get a color from the palette"""
-    return COLORS.get(name, COLORS['primary'])
+    return COLORS.get(name, COLORS['first'])
