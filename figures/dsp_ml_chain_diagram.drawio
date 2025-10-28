@@ -1,6 +1,6 @@
 <mxfile host="app.diagrams.net" agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0" version="27.1.6">
   <diagram name="Page-1" id="E_GemQlj27VM8vH7J51C">
-    <mxGraphModel dx="783" dy="1138" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+    <mxGraphModel dx="921" dy="1339" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
@@ -15,6 +15,9 @@
         </mxCell>
         <mxCell id="z19B6dMdqbQDIFOihRp6-2" value="DataLoader(shuffle, batch B)" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
           <mxGeometry x="40" y="440" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="z19B6dMdqbQDIFOihRp6-28" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="z19B6dMdqbQDIFOihRp6-3" target="z19B6dMdqbQDIFOihRp6-27">
+          <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="z19B6dMdqbQDIFOihRp6-3" value="Windowing(W / H, causal)" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
           <mxGeometry x="40" y="540" width="120" height="60" as="geometry" />
@@ -57,8 +60,17 @@
         <mxCell id="z19B6dMdqbQDIFOihRp6-21" value="Prefilter(Notch, FFT)" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
           <mxGeometry x="320" y="360" width="120" height="60" as="geometry" />
         </mxCell>
-        <mxCell id="z19B6dMdqbQDIFOihRp6-24" value="TCN (residual)" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+        <mxCell id="z19B6dMdqbQDIFOihRp6-30" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="z19B6dMdqbQDIFOihRp6-24" target="z19B6dMdqbQDIFOihRp6-29">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="z19B6dMdqbQDIFOihRp6-24" value="Concat(x || x_dsp)" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
           <mxGeometry x="500" y="440" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="z19B6dMdqbQDIFOihRp6-27" value="Y[n]" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="240" y="640" width="50" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="z19B6dMdqbQDIFOihRp6-29" value="TCN(Residual)" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="660" y="440" width="120" height="60" as="geometry" />
         </mxCell>
       </root>
     </mxGraphModel>
