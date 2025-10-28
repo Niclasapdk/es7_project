@@ -137,8 +137,8 @@ psd_values = {
 }
 figChirp, axChirp = plt.subplots()
 
-num_chirps = 3
-chirp_spacing = 25 
+num_chirps = 2
+chirp_spacing = 50 
 
 colors = [get_color('first'), get_color('second'), get_color('third'), get_color('fourth')]
 for idx, (band_name, band_info) in enumerate(bandsChirp.items()):
