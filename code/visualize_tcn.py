@@ -1,273 +1,353 @@
 #!/usr/bin/env python3
-import argparse, math, numpy as np, torch, torch.nn as nn, torch.nn.functional as F
+# visualize_tcn.py — Notch+TCN inference (no alignment) with diagnostics & blind post-AGC
+from __future__ import annotations
+import argparse
+from pathlib import Path
+import numpy as np
+import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
 
-# ======== Model variants that match different checkpoint schemas ========
-import torch.nn as nn
-import torch.nn.functional as F
+# ---------------- I/Q helpers ----------------
+def ensure_iq(x: torch.Tensor) -> torch.Tensor:
+    x = x.float()
+    assert x.ndim == 3 and x.shape[-1] == 2, f"Expected [B,T,2], got {tuple(x.shape)}"
+    return x.contiguous()
 
+def complex_from_iq(x: torch.Tensor) -> torch.Tensor:
+    x = ensure_iq(x)
+    return torch.complex(x[..., 0], x[..., 1])
+
+def iq_from_complex(z: torch.Tensor) -> torch.Tensor:
+    if not torch.is_complex(z):
+        raise RuntimeError("Expected complex tensor")
+    return torch.stack([z.real, z.imag], dim=-1)
+
+# ---------------- Data loading (mirrors trainer) ----------------
+def load_npz(path: str):
+    npz = np.load(path)
+    keys = set(npz.keys())
+    if {"Xtr", "Ytr", "Xva", "Yva"}.issubset(keys):
+        Xtr, Ytr, Xva, Yva = npz["Xtr"], npz["Ytr"], npz["Xva"], npz["Yva"]
+        mid = max(1, Xva.shape[0] // 2)
+        return {
+            "train": (Xtr, Ytr),
+            "val":   (Xva[:mid],  Yva[:mid]),
+            "test":  (Xva[mid:],  Yva[mid:])
+        }
+    if {"X", "Y"}.issubset(keys):
+        X, Y = npz["X"], npz["Y"]
+        N = X.shape[0]
+        ntr = int(0.8 * N)
+        nva = int(0.1 * N)
+        return {
+            "train": (X[:ntr], Y[:ntr]),
+            "val":   (X[ntr:ntr+nva], Y[ntr:ntr+nva]),
+            "test":  (X[ntr+nva:], Y[ntr+nva:])
+        }
+    raise ValueError(f"Unexpected keys in {path}: {sorted(keys)}")
+
+# ---------------- Notch prefilter (same as trainer) ----------------
+@torch.no_grad()
+def notch_prefilter(x: torch.Tensor, fs: float, inband_hz: float, guard_hz: float,
+                    max_depth_in_db: float = 40.0, max_depth_out_db: float = 120.0, q: float = 600.0) -> torch.Tensor:
+    def _as_complex(x):
+        if x.ndim == 3 and x.shape[-1] == 2:
+            z = complex_from_iq(x)
+            return z, iq_from_complex
+        if torch.is_complex(x):
+            return x, (lambda z: z)
+        xr = x.float()
+        return xr, (lambda z: z.real)
+
+    z, back = _as_complex(x)  # [B,T] complex
+    B, T = z.shape
+    Z = torch.fft.fft(z, n=T, dim=1)
+    freqs = torch.fft.fftfreq(T, d=1.0 / fs, device=z.device)
+
+    BW = float(inband_hz)
+    lo, hi = -(BW / 2 + guard_hz), (BW / 2 + guard_hz)
+
+    d = torch.zeros_like(freqs).float()
+    d = torch.where(freqs < lo, lo - freqs, d)
+    d = torch.where(freqs > hi, freqs - hi, d)
+
+    s = (d / (guard_hz + 1e-6)).clamp(min=0.0)
+    s = s * s * (3 - 2 * s.clamp(max=1.0))  # smoothstep
+
+    depth_db = max_depth_in_db + (max_depth_out_db - max_depth_in_db) * s
+    depth_lin = torch.pow(10.0, -depth_db / 20.0)
+
+    mag = Z.abs()
+    thresh = mag.mean(dim=1, keepdim=True) * 5.0
+    attn = 1.0 / (1.0 + (mag / (thresh + 1e-6)))
+    base = depth_lin[None, :]
+    mask = torch.maximum(attn, base)
+
+    Zf = Z * mask
+    zf = torch.fft.ifft(Zf, n=T, dim=1)
+    return back(zf)
+
+# ---------------- Model (names match checkpoint) ----------------
 class CausalConv1d(nn.Conv1d):
-    def __init__(self, in_ch, out_ch, kernel, dilation=1, bias=True):
-        super().__init__(in_ch, out_ch, kernel, stride=1, padding=0, dilation=dilation, bias=bias)
-        self.left_pad = dilation * (kernel - 1)
+    def __init__(self, C_in, C_out, k, d=1):
+        pad = (k - 1) * d
+        super().__init__(C_in, C_out, k, padding=pad, dilation=d)
+        self._pad = pad
     def forward(self, x):
-        return super().forward(F.pad(x, (self.left_pad, 0)))
+        y = super().forward(x)
+        if self._pad:
+            y = y[..., :-self._pad]
+        return y
 
-# --- Variant A: WeightNorm TCN (keys like: tcn.0.c1.weight_g / tcn.0.c2.weight_v) ---
-class ResidualBlockWN(nn.Module):
-    def __init__(self, ch, kernel, dilation, dropout=0.0):
+class TCNBlock(nn.Module):
+    # Keep attribute names conv1/conv2/norm1/norm2 (matches training checkpoint)
+    def __init__(self, C, k, d, dropout=0.0):
         super().__init__()
-        self.c1 = nn.utils.weight_norm(CausalConv1d(ch, ch, kernel, dilation=dilation))
-        self.c2 = nn.utils.weight_norm(CausalConv1d(ch, ch, kernel, dilation=dilation))
-        self.dp = nn.Dropout(dropout)
-        self.act = nn.ReLU(inplace=True)
+        self.conv1 = CausalConv1d(C, C, k, d)
+        self.conv2 = CausalConv1d(C, C, k, d)
+        self.norm1 = nn.BatchNorm1d(C)
+        self.norm2 = nn.BatchNorm1d(C)
+        self.drop = nn.Dropout(dropout)
+        self.act  = nn.GELU()
     def forward(self, x):
-        y = self.act(self.c1(x))
-        y = self.dp(y)
-        y = self.act(self.c2(y))
-        return x + y
+        y = self.conv1(x); y = self.norm1(y); y = self.act(y); y = self.drop(y)
+        y = self.conv2(y); y = self.norm2(y); y = self.drop(y)
+        return self.act(x + y)
 
-class TCN_WN(nn.Module):
-    """Matches checkpoints with keys like: inp.*, tcn.<idx>.c1.*, tcn.<idx>.c2.*, out.*"""
-    def __init__(self, in_ch=2, out_ch=2, width=192, blocks=10, kernel=7, dilation_growth=2, dropout=0.0):
+class ResidualTCN(nn.Module):
+    def __init__(self, in_ch=4, hid=64, blocks=8, k=7, dropout=0.05):
         super().__init__()
-        self.inp = nn.Conv1d(in_ch, width, 1)
-        layers, d = [], 1
-        for _ in range(blocks):
-            layers.append(ResidualBlockWN(width, kernel, dilation=d, dropout=dropout)); d *= dilation_growth
-        self.tcn = nn.Sequential(*layers)
-        self.out = nn.Conv1d(width, out_ch, 1)
-    def forward(self, x): return self.out(self.tcn(self.inp(x)))
+        self.inp = CausalConv1d(in_ch, hid, k=3, d=1)
+        self.tcn = nn.Sequential(*[TCNBlock(hid, k, 2**b, dropout) for b in range(blocks)])
+        self.out = CausalConv1d(hid, 2, k=3, d=1)
+    def forward(self, x):  # x: [B,C,T]
+        h = self.inp(x); h = self.tcn(h); r = self.out(h); return r
 
-# --- Variant B: Batch/GroupNorm TCN (keys like: blocks.0.conv1.*, blocks.0.norm1.*) ---
-class ResidualBlockBN(nn.Module):
-    def __init__(self, ch, kernel, dilation, dropout=0.0, norm_kind="bn"):
-        super().__init__()
-        self.conv1 = CausalConv1d(ch, ch, kernel, dilation=dilation)
-        self.conv2 = CausalConv1d(ch, ch, kernel, dilation=dilation)
-        if norm_kind == "bn":
-            self.norm1 = nn.BatchNorm1d(ch)
-            self.norm2 = nn.BatchNorm1d(ch)
-        elif norm_kind == "gn":
-            self.norm1 = nn.GroupNorm(8, ch)  # 8 groups as a sane default
-            self.norm2 = nn.GroupNorm(8, ch)
-        else:
-            self.norm1 = nn.Identity()
-            self.norm2 = nn.Identity()
-        self.dp = nn.Dropout(dropout)
-        self.act = nn.ReLU(inplace=True)
-    def forward(self, x):
-        y = self.conv1(x); y = self.norm1(y); y = self.act(y)
-        y = self.dp(y)
-        y = self.conv2(y); y = self.norm2(y); y = self.act(y)
-        return x + y
+def build_from_ckpt(ckpt_path: str, device: torch.device, apply_ema: bool = True):
+    ck = torch.load(ckpt_path, map_location=device)
+    a = ck.get("args", {})
+    model = ResidualTCN(
+        in_ch=4,
+        hid=int(a.get("width", 64)),
+        blocks=int(a.get("blocks", 8)),
+        k=int(a.get("kernel", 7)),
+        dropout=float(a.get("dropout", 0.05)),
+    ).to(device)
 
-class TCN_BN(nn.Module):
-    """Matches checkpoints with keys like: inp.*, blocks.<idx>.conv1.*, blocks.<idx>.norm1.*, out.*"""
-    def __init__(self, in_ch=2, out_ch=2, width=192, blocks=10, kernel=7, dilation_growth=2, dropout=0.0, norm_kind="bn"):
-        super().__init__()
-        self.inp = nn.Conv1d(in_ch, width, 1)
-        self.blocks = nn.ModuleList()
-        d = 1
-        for _ in range(blocks):
-            self.blocks.append(ResidualBlockBN(width, kernel, dilation=d, dropout=dropout, norm_kind=norm_kind))
-            d *= dilation_growth
-        self.out = nn.Conv1d(width, out_ch, 1)
-    def forward(self, x):
-        h = self.inp(x)
-        for b in self.blocks: h = b(h)
-        return self.out(h)
+    model.load_state_dict(ck["model"], strict=True)
 
-# ----- Utils -----
-def to_T2(a):
-    a = np.asarray(a)
-    if np.iscomplexobj(a): return np.stack([a.real, a.imag], -1).astype(np.float32)
-    a = np.squeeze(a)
-    if a.ndim == 1: return np.stack([a.astype(np.float32), np.zeros_like(a, np.float32)], -1)
-    if a.ndim == 2:
-        if a.shape[-1]==2: return a.astype(np.float32)
-        if a.shape[0]==2:  return a.T.astype(np.float32)
-        if a.shape[-1]==1: return np.concatenate([a.astype(np.float32), np.zeros_like(a, np.float32)], -1)
-        if a.shape[0]==1:
-            b=a.reshape(-1).astype(np.float32); return np.stack([b, np.zeros_like(b)], -1)
-    return to_T2(np.squeeze(a))
-
-def complex_from_T2(x): return x[...,0].astype(np.float32) + 1j*x[...,1].astype(np.float32)
-def evm_pct(yhat, ref):
-    num = np.sum(np.abs(yhat-ref)**2); den = np.sum(np.abs(ref)**2) + 1e-12
-    return float(np.sqrt(num/den)*100.0)
-def snr_db(sig, err):
-    ps = np.mean(np.abs(sig)**2)+1e-12; pe = np.mean(np.abs(err)**2)+1e-12
-    return 10.0*np.log10(ps/pe)
-
-def norm_none(x):        return x.astype(np.float32), {"mode":"none"}
-def norm_center(x):
-    mu = np.mean(x,0,keepdims=True); return (x-mu).astype(np.float32), {"mode":"center","mu":mu}
-def norm_unit_rms_global(x):
-    mu = np.mean(x,0,keepdims=True); xc = x-mu; rms = np.sqrt(np.mean(xc**2)+1e-12)
-    return (xc/rms).astype(np.float32), {"mode":"urg","mu":mu,"rms":rms}
-def norm_unit_rms_perch(x):
-    mu = np.mean(x,0,keepdims=True); xc = x-mu; rms = np.sqrt(np.mean(xc**2,axis=0,keepdims=True)+1e-12)
-    return (xc/rms).astype(np.float32), {"mode":"urp","mu":mu,"rms":rms}
-
-def denorm(y, stats):
-    m=stats["mode"]
-    if m=="none": return y.astype(np.float32)
-    if m=="center": return (y + stats["mu"]).astype(np.float32)
-    if m=="urg": return (y*stats["rms"] + stats["mu"]).astype(np.float32)
-    if m=="urp": return (y*stats["rms"] + stats["mu"]).astype(np.float32)
-    return y.astype(np.float32)
-
-def detect_xy_keys(nzf, split):
-    keys=list(nzf.keys()); split=split.lower()
-    xs=[f"X{split[:2]}", f"X_{split}", f"X{split}", f"x_{split}", f"x{split}",
-        "X","input","jammed","noisy","J","Xte","Xtest","Xva","Xval","Xtr","Xtrain"]
-    ys=[f"Y{split[:2]}", f"Y_{split}", f"Y{split}", f"y_{split}", f"y{split}",
-        "Y","target","clean","Yte","Ytest","Yva","Yval","Ytr","Ytrain"]
-    xs=[k for k in xs if k in keys]; ys=[k for k in ys if k in keys]
-    for xk in xs:
-        for yk in ys:
-            if nzf[xk].shape[0]==nzf[yk].shape[0]: return xk, yk
-    raise KeyError(f"Could not find X/Y keys in {keys}")
-
-def build_and_load_exact(ckpt_path, device):
-    import torch
-    ckpt = torch.load(ckpt_path, map_location=device)
-
-    # Pull arch args (width/blocks/kernel/dropout); fall back to sane defaults
-    a = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
-    width  = int(a.get("width", 192))
-    blocks = int(a.get("blocks", 10))
-    kernel = int(a.get("kernel", 7))
-    drop   = float(a.get("dropout", 0.0))
-
-    # Extract a candidate state dict (EMA > state_dict > model_state > model > net > top-level)
-    def looks_like_state(d):
-        return isinstance(d, dict) and any(("weight" in k or "bias" in k) for k in d.keys())
-    state, source = None, None
-    if isinstance(ckpt, dict):
-        use_ema = bool(a.get("eval_use_ema", False))
-        if use_ema and "ema_state" in ckpt and looks_like_state(ckpt["ema_state"]):
-            state, source = ckpt["ema_state"], "ema_state"
-        else:
-            for k in ("state_dict","model_state","model","net"):
-                if k in ckpt and looks_like_state(ckpt[k]):
-                    state, source = ckpt[k], k; break
-            if state is None and looks_like_state(ckpt):
-                state, source = ckpt, "top_level"
-    else:
-        state, source = ckpt, "raw"
-
-    if state is None:
-        raise RuntimeError("No weights found in checkpoint.")
-
-    # Strip 'module.' prefixes if saved with DDP
-    state = { (k[7:] if k.startswith("module.") else k): v for k,v in state.items() }
-    keys = list(state.keys())
-
-    # ---- ARCH DETECTION by key pattern ----
-    if any(k.startswith("blocks.0.conv1.") for k in keys):
-        arch_kind = "BN"
-        model = TCN_BN(in_ch=2, out_ch=2, width=width, blocks=blocks, kernel=kernel, dropout=drop, norm_kind="bn").to(device)
-    elif any(k.startswith("tcn.0.c1.") for k in keys) or any(".weight_g" in k for k in keys):
-        arch_kind = "WN"
-        model = TCN_WN(in_ch=2, out_ch=2, width=width, blocks=blocks, kernel=kernel, dropout=drop).to(device)
-    else:
-        raise RuntimeError("Unknown checkpoint layout (neither 'blocks.*.conv1.*' nor 'tcn.*.c1.*').")
-
-    # Load strictly
-    ret = model.load_state_dict(state, strict=True)
-    missing = getattr(ret, "missing_keys", [])
-    unexpected = getattr(ret, "unexpected_keys", [])
-    print(f"[arch] {arch_kind} | [load] source={source} | missing={missing} | unexpected={unexpected}")
-    print("[params]", sum(p.numel() for p in model.parameters()))
+    if apply_ema and ck.get("ema", None):
+        with torch.no_grad():
+            ema_state = ck["ema"]
+            for n, p in model.named_parameters():
+                if n in ema_state:
+                    p.copy_(ema_state[n].to(device))
     model.eval()
-    return model, a
 
+    sig = dict(
+        fs=float(a.get("fs", 4.092e6)),
+        inband=float(a.get("inband", 2.046e6)),
+        guard=float(a.get("guard", 150e3)),
+        notch_in=float(a.get("notch_in_db", 40.0)),
+        notch_out=float(a.get("notch_out_db", 120.0)),
+        notch_q=float(a.get("notch_q", 600.0)),
+    )
+    return model, sig
 
-# ----- Main -----
+# ---------------- Metrics & diagnostics ----------------
+@torch.no_grad()
+def snr_in_out_raw(x_in: torch.Tensor, y_true: torch.Tensor, y_pred: torch.Tensor):
+    yt = complex_from_iq(y_true)
+    xp = complex_from_iq(x_in)
+    yp = complex_from_iq(y_pred)
+    s = (yt.abs()**2).sum(dim=1).clamp_min(1e-12)
+    n_in  = ((xp - yt).abs()**2).sum(dim=1).clamp_min(1e-12)
+    n_out = ((yp - yt).abs()**2).sum(dim=1).clamp_min(1e-12)
+    snr_in  = 10.0 * torch.log10((s / n_in)).mean().item()
+    snr_out = 10.0 * torch.log10((s / n_out)).mean().item()
+    return snr_in, snr_out
+
+@torch.no_grad()
+def evm_pct_raw(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+    yt = complex_from_iq(y_true)
+    yp = complex_from_iq(y_pred)
+    evm = torch.sqrt(((yp - yt).abs()**2).sum(dim=1) / (yt.abs()**2).sum(dim=1).clamp_min(1e-12)).mean().item()
+    return 100.0 * evm
+
+@torch.no_grad()
+def complex_corr_mag_phase(a_iq: torch.Tensor, b_iq: torch.Tensor):
+    a = complex_from_iq(a_iq); b = complex_from_iq(b_iq)
+    num = torch.sum(a.conj()*b, dim=1)
+    den = torch.sqrt((a.abs()**2).sum(dim=1) * (b.abs()**2).sum(dim=1)).clamp_min(1e-12)
+    rho = num / den
+    rho_m = rho.abs().mean().item()
+    rho_p = torch.atan2(rho.mean().imag, rho.mean().real).item()
+    return rho_m, rho_p
+
+@torch.no_grad()
+def diag_aligned_scores(y_true: torch.Tensor, y_pred: torch.Tensor):
+    yt = complex_from_iq(y_true)
+    yp = complex_from_iq(y_pred)
+    num = torch.sum(yp.conj() * yt, dim=1, keepdim=True)                # [B,1] complex
+    den = (yp.abs()**2).sum(dim=1, keepdim=True).clamp_min(1e-12)       # [B,1] real
+    alpha = num / den                                                    # [B,1] complex
+    ypa = yp * alpha
+    s = (yt.abs()**2).sum(dim=1).clamp_min(1e-12)
+    n_out = ((ypa - yt).abs()**2).sum(dim=1).clamp_min(1e-12)
+    snr_out_a = 10.0 * torch.log10(s / n_out).mean().item()
+    evm_a = torch.sqrt(n_out / s).mean().item() * 100.0
+    a_mean = alpha.mean()
+    a_mag = a_mean.abs().item()
+    a_phase = torch.atan2(a_mean.imag, a_mean.real).item()
+    return snr_out_a, evm_a, a_mag, a_phase
+
+@torch.no_grad()
+def align_ls_to(target_iq: torch.Tensor, pred_iq: torch.Tensor) -> torch.Tensor:
+    """One-tap complex LS: return pred aligned to target (no ground-truth needed if target=base)."""
+    t = complex_from_iq(target_iq)
+    p = complex_from_iq(pred_iq)
+    den = (p.abs()**2).sum(dim=1, keepdim=True).clamp_min(1e-12)
+    alpha = (torch.sum(p.conj()*t, dim=1, keepdim=True)) / den
+    return iq_from_complex(p * alpha)
+
+# ---------------- Plotting ----------------
+def db10(x: np.ndarray) -> np.ndarray:
+    return 10.0 * np.log10(np.maximum(x, 1e-12))
+
+def psd_db(x: torch.Tensor) -> np.ndarray:
+    z = x[:, 0].float().cpu().numpy() + 1j * x[:, 1].float().cpu().numpy()
+    X = np.fft.fftshift(np.fft.fft(z))
+    P = (np.abs(X) ** 2) / max(1, len(z))
+    return db10(P)
+
+def plot_sample(idx: int, fs: float, jam: torch.Tensor, base: torch.Tensor, den: torch.Tensor, ref: torch.Tensor, outdir: Path):
+    T = jam.shape[0]
+    t = np.arange(T) / fs
+    fig, ax = plt.subplots(2, 1, figsize=(10, 7))
+
+    ax[0].plot(t, jam[:, 0].cpu().numpy(), label="jammed (I)")
+    ax[0].plot(t, base[:, 0].cpu().numpy(), label="notch base (I)", alpha=0.8)
+    ax[0].plot(t, den[:, 0].cpu().numpy(), label="denoised (I)", alpha=0.9)
+    ax[0].plot(t, ref[:, 0].cpu().numpy(), label="clean ref (I)", alpha=0.9, linestyle="--")
+    ax[0].set_xlabel("time [s]"); ax[0].set_ylabel("amplitude")
+    ax[0].legend(loc="upper right"); ax[0].grid(True, alpha=0.3)
+
+    freqs = np.fft.fftshift(np.fft.fftfreq(T, d=1.0 / fs))
+    ax[1].plot(freqs, psd_db(jam), label="jammed")
+    ax[1].plot(freqs, psd_db(base), label="notch base", alpha=0.8)
+    ax[1].plot(freqs, psd_db(den), label="denoised", alpha=0.9)
+    ax[1].plot(freqs, psd_db(ref), label="clean ref", alpha=0.9, linestyle="--")
+    ax[1].set_xlabel("frequency [Hz]"); ax[1].set_ylabel("PSD [dB]")
+    ax[1].legend(loc="upper right"); ax[1].grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    out = outdir / f"denoise_sample_{idx:04d}.png"
+    fig.savefig(out, dpi=140)
+    plt.close(fig)
+    return out
+
+# ---------------- Main ----------------
+@torch.no_grad()
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--data", required=True)
-    ap.add_argument("--split", default="test")
-    ap.add_argument("--x-key"); ap.add_argument("--y-key")
-    ap.add_argument("--idx", type=int, default=0)
-    ap.add_argument("--eval-n", type=int, default=0)
-    ap.add_argument("--save", default=None)
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap = argparse.ArgumentParser("Inference for notch+TCN (no alignment)")
+    ap.add_argument("--ckpt", required=True, type=str, help="Path to best.pt")
+    ap.add_argument("--data", required=True, type=str, help="NPZ with X/Y")
+    ap.add_argument("--split", default="val", choices=["train","val","test"])
+    ap.add_argument("--idx", type=int, default=None, help="If set, evaluate this index only")
+    ap.add_argument("--num", type=int, default=8, help="How many samples to dump (ignored if --idx is set)")
+    ap.add_argument("--outdir", type=str, default="eval_dumps")
+    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--no-ema", action="store_true", help="Do not apply EMA weights from checkpoint")
+    ap.add_argument("--diag-align", dest="diag_align", action="store_true",
+                    help="Also print aligned SNR/EVM for diagnostics")
+    ap.add_argument("--rms-norm", dest="rms_norm", choices=["off", "y"], default="off",
+                    help="Per-window RMS norm by Y RMS (diagnostic).")
+    ap.add_argument("--post-agc", choices=["off","base","gt"], default="off",
+                    help="One-tap complex gain on model output: 'base' = align to notch base (blind), 'gt' = align to ground truth (diagnostic)")
     args = ap.parse_args()
 
-    device=torch.device(args.device)
-    model, margs = build_and_load_exact(args.ckpt, device)
+    device = torch.device(args.device)
+    model, sig = build_from_ckpt(args.ckpt, device, apply_ema=(not args.no_ema))
 
-    nzf = np.load(args.data, allow_pickle=True)
-    try:
-        xk, yk = (args.x_key, args.y_key) if (args.x_key and args.y_key) else detect_xy_keys(nzf, args.split)
-        X, Y = nzf[xk], nzf[yk]
-    finally:
-        nzf.close()
-    print(f"[info] keys: X='{xk}', Y='{yk}' | shapes: X{X.shape}, Y{Y.shape}")
+    splits = load_npz(args.data)
+    X, Y = splits[args.split]
+    outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
 
-    # All combos to try
-    norms = [("none", norm_none), ("center", norm_center),
-             ("unit_rms_global", norm_unit_rms_global), ("unit_rms_perch", norm_unit_rms_perch)]
-    outmodes = ["clean","x-minus","x-plus"]
+    if args.idx is not None:
+        indices = [int(args.idx)]
+    else:
+        N = X.shape[0]
+        indices = list(range(min(args.num, N)))
 
-    def run_once(i):
-        x=to_T2(X[i]); y=to_T2(Y[i]); T=min(len(x),len(y)); x=x[:T]; y=y[:T]
-        best=None; best_evm=1e9; best_info=None; best_yhat=None
-        for nname, nfn in norms:
-            x_n, st = nfn(x)
-            with torch.no_grad():
-                xin = torch.from_numpy(x_n.T).float().unsqueeze(0).to(device)
-                pred_n = model(xin).squeeze(0).cpu().numpy().T
-            cand = {
-                "clean":   denorm(pred_n, st),
-                "x-minus": denorm(x_n - pred_n, st),
-                "x-plus":  denorm(x_n + pred_n, st),
-            }
-            ref_c = complex_from_T2(y)
-            for mode in outmodes:
-                yh = cand[mode]
-                evm = evm_pct(complex_from_T2(yh), ref_c)
-                if evm < best_evm:
-                    best_evm = evm; best = (nname, mode); best_yhat = yh
-                    best_info = (x, y, yh)
-        # metrics
-        x, y, yhat = best_info
-        jam_c = complex_from_T2(x); den_c = complex_from_T2(yhat); ref_c = complex_from_T2(y)
-        evm_in = evm_pct(jam_c, ref_c); evm_out = evm_pct(den_c, ref_c)
-        snr_in = snr_db(ref_c, jam_c-ref_c); snr_out = snr_db(ref_c, den_c-ref_c)
-        return dict(idx=i, norm=best[0], mode=best[1], evm_in=evm_in, evm_out=evm_out,
-                    snr_in=snr_in, snr_out=snr_out, dsnr=snr_out-snr_in, yhat=best_yhat, x=x, y=y)
+    # accumulators
+    snr_in_list = []; snr_out_list = []; evm_list = []
+    snr_out_align_list = []; evm_align_list = []
+    base_snr_out_list = []; base_evm_list = []
 
-    # optional quick eval across N samples
-    if args.eval_n>0:
-        import random
-        idxs = random.sample(range(X.shape[0]), min(args.eval_n, X.shape[0]))
-        res=[run_once(i) for i in idxs]
-        print(f"[EVAL {len(res)}] mean EVM_in {np.mean([r['evm_in'] for r in res]):.2f}% | "
-              f"mean EVM_out {np.mean([r['evm_out'] for r in res]):.2f}% | mean ΔSNR {np.mean([r['dsnr'] for r in res]):+.2f} dB")
-        # also print the most common chosen combo
-        from collections import Counter
-        print("[combo] most common:", Counter((r['norm'], r['mode']) for r in res).most_common(3))
+    for j, idx in enumerate(indices, 1):
+        xb = torch.from_numpy(X[idx:idx+1]).to(device)  # [1,T,2]
+        yb = torch.from_numpy(Y[idx:idx+1]).to(device)
 
-    # single index plot
-    r = run_once(args.idx)
-    print(f"[single idx {r['idx']}] norm={r['norm']} mode={r['mode']} | "
-          f"EVM_in {r['evm_in']:.2f}% -> EVM_out {r['evm_out']:.2f}% | "
-          f"SNR_in {r['snr_in']:.2f} dB -> SNR_out {r['snr_out']:.2f} dB | ΔSNR {r['dsnr']:+.2f} dB")
+        # Optional per-sample RMS norm (diagnostic)
+        if args.rms_norm == "y":
+            r = torch.sqrt((yb.pow(2).sum() / yb.numel()).clamp_min(1e-12))
+            xb = xb / r
+            yb = yb / r
 
-    t = np.arange(len(r['x']))
-    plt.figure(figsize=(11,5.5))
-    plt.plot(t, r['x'][:,0], label=f"Jammed (EVM {r['evm_in']:.2f}%, SNR {r['snr_in']:.2f} dB)")
-    plt.plot(t, r['yhat'][:,0], label=f"Denoised [{r['mode']}, {r['norm']}] (EVM {r['evm_out']:.2f}%, SNR {r['snr_out']:.2f} dB)")
-    plt.plot(t, r['y'][:,0], label="Clean (reference)", linewidth=1.4)
-    plt.title(f"TCN Denoising | idx {r['idx']} | ΔSNR {r['dsnr']:+.2f} dB")
-    plt.xlabel("Sample"); plt.ylabel("I component"); plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
-    if args.save: plt.savefig(args.save, dpi=150); print("[saved]", args.save)
-    plt.show()
+        # Notch base and model forward
+        base = notch_prefilter(xb, sig["fs"], sig["inband"], sig["guard"],
+                               max_depth_in_db=sig["notch_in"], max_depth_out_db=sig["notch_out"], q=sig["notch_q"])
+        jam = xb.permute(0, 2, 1)          # [1,2,T]
+        bas = base.permute(0, 2, 1)        # [1,2,T]
+        inp = torch.cat([jam, bas], dim=1) # [1,4,T]
+        resid = model(inp).permute(0, 2, 1)
+        yhat = base + resid                # [1,T,2]
+
+        # Blind post-AGC (optional)
+        yhat_eff = yhat
+        if args.post_agc == "base":
+            yhat_eff = align_ls_to(base, yhat)   # blind, no GT
+        elif args.post_agc == "gt":              # diagnostic
+            yhat_eff = align_ls_to(yb, yhat)
+
+        # Metrics: BASE (for reference)
+        _, so_b = snr_in_out_raw(xb, yb, base)
+        ev_b = evm_pct_raw(yb, base)
+        base_snr_out_list.append(so_b); base_evm_list.append(ev_b)
+
+        # Metrics: MODEL (effective output)
+        si, so = snr_in_out_raw(xb, yb, yhat_eff)
+        ev = evm_pct_raw(yb, yhat_eff)
+        snr_in_list.append(si); snr_out_list.append(so); evm_list.append(ev)
+
+        rho_m, rho_p = complex_corr_mag_phase(yb, yhat_eff)
+
+        msg = (f"[{j}/{len(indices)}] idx={idx} "
+               f"| BASE: SNR_out={so_b:+.2f} dB, EVM={ev_b:.2f}% "
+               f"|| MODEL: SNR_in={si:+.2f} → SNR_out={so:+.2f} dB, EVM={ev:.2f}% "
+               f"|| corr(|rho|)={rho_m:.3f}, ∠rho={rho_p:.2f} rad "
+               f"{'(post-agc='+args.post_agc+')' if args.post_agc!='off' else ''}")
+        if args.diag_align:
+            soA, evA, amag, aphase = diag_aligned_scores(yb, yhat_eff)
+            snr_out_align_list.append(soA); evm_align_list.append(evA)
+            msg += f" || (aligned) SNR_out={soA:+.2f} dB, EVM={evA:.2f}% | |α|≈{amag:.3f}, ∠α≈{aphase:.2f}"
+        print(msg)
+        rho_xy_m, rho_xy_p = complex_corr_mag_phase(xb, yb)
+        rho_by_m, rho_by_p = complex_corr_mag_phase(base, yb)
+        print(f"... || corr(X,Y)={rho_xy_m:.3f}, corr(base,Y)={rho_by_m:.3f}")
+
+        _ = plot_sample(idx, sig["fs"], xb[0], base[0], yhat_eff[0], yb[0], outdir)
+
+    # Averages
+    if len(indices) > 1:
+        line = (f"Avg over {len(indices)} samples: "
+                f"BASE SNR_out {np.mean(base_snr_out_list):+.2f} dB | BASE EVM {np.mean(base_evm_list):.2f}%  ||  "
+                f"MODEL SNR_in {np.mean(snr_in_list):+.2f} dB → SNR_out {np.mean(snr_out_list):+.2f} dB | "
+                f"MODEL EVM {np.mean(evm_list):.2f}%")
+        if args.diag_align and snr_out_align_list:
+            line += f"  ||  (aligned) SNR_out {np.mean(snr_out_align_list):+.2f} dB | EVM {np.mean(evm_align_list):.2f}%"
+        print(line)
 
 if __name__ == "__main__":
     main()

@@ -206,49 +206,94 @@ def notch_prefilter(x: torch.Tensor, fs: float,
                     inband_hz: float, guard_hz: float,
                     max_depth_in: float = 40.0, max_depth_out: float = 80.0,
                     q: float = 600.0) -> torch.Tensor:
+    # ---- helpers ------------------------------------------------------------
     def _as_complex(x: torch.Tensor):
-        if x.ndim == 3 and x.shape[-1] == 2:
+        if x.ndim == 3 and x.shape[-1] == 2:        # [B,T,2] IQ
             z = complex_from_iq(x)
-            def fmt(yc): return iq_from_complex(yc)
+            def fmt(yc): return iq_from_complex(yc)  # back to [B,T,2]
             return z, fmt
         if torch.is_complex(x):
-            def fmt(yc): return yc
+            def fmt(yc): return yc                  # keep complex
             return x, fmt
-        xr = x.to(torch.float32)
-        def fmt(yc): return yc.real
+        xr = x.to(torch.float32)                    # real [B,T]
+        def fmt(yc): return yc.real                 # return real
         return xr, fmt
 
-    x_c, fmt = _as_complex(x)
+    def smoothstep01(t):
+        # clamp to [0,1] and apply smoothstep
+        return (t.clamp_(0, 1) ** 2) * (3 - 2 * t.clamp(0, 1))
+
+    # ---- inputs & FFT -------------------------------------------------------
+    x_c, fmt = _as_complex(x)               # [B,T]
     B, T = x_c.shape
-    X = torch.fft.rfft(x_c, n=T, dim=1)
+    dev = x_c.device
+
+    inband_hz = float(inband_hz)
+    guard_hz  = float(guard_hz)
+    eps = 1e-12
+
+    is_complex_in = torch.is_complex(x_c)
+
+    if is_complex_in:
+        # Complex baseband: full FFT
+        X = torch.fft.fft(x_c, n=T, dim=1)                 # [B,T] complex
+        freqs = torch.fft.fftfreq(T, d=1.0 / fs).to(dev)   # [T], can be negative
+    else:
+        # Real signal: real FFT
+        X = torch.fft.rfft(x_c, n=T, dim=1)                # [B,F] complex, F=T//2+1
+        freqs = torch.fft.rfftfreq(T, d=1.0 / fs).to(dev)  # [F] >= 0
+
+    F = X.shape[-1]                    # number of freq bins actually used
+    freqs = freqs.to(torch.float32)    # real frequency grid
+    bin_hz = float(abs(freqs[1] - freqs[0])) if F > 1 else fs / max(T, 1)
+
+    # Peak bin (ignore DC)
     mag = X.abs()
-    peak_bin = torch.argmax(mag[:, 1:], dim=1) + 1  # ignore DC
-    freqs = torch.linspace(0.0, fs / 2.0, T // 2 + 1, device=x_c.device)
+    peak_bin = torch.argmax(mag[:, 1:], dim=1) + 1         # [B] (skip DC)
 
-    peak_freq = freqs[peak_bin]
-    cap_db = torch.where(
-        peak_freq <= guard_hz,
-        torch.where(peak_freq <= inband_hz,
-                    torch.full_like(peak_freq, max_depth_in),
-                    torch.full_like(peak_freq, max_depth_out)),
-        torch.full_like(peak_freq, max_depth_out)
-    )
-    cap = 10.0 ** (-cap_db / 20.0)
+    # Find the peak frequency in Hz for each batch
+    f = freqs.unsqueeze(0).expand(B, -1)                   # [B,F]
+    f0 = f.gather(1, peak_bin.view(-1, 1)).squeeze(1)      # [B]
 
-    df = (fs / 2.0) / (T // 2)
-    f0 = peak_freq.clamp_min(1.0)
-    sigma_bins = (f0 / (q * df)).clamp_min(1.5)
+    # Gaussian notch width: use fs/q (fallback to at least one bin)
+    bw_hz = max(bin_hz, fs / max(q, 1e-6))
+    sigma_hz = bw_hz / 2.355                                # FWHM -> sigma
 
-    F = X.shape[1]
-    idx = torch.arange(F, device=x_c.device)[None, :].repeat(B, 1)
-    pb = peak_bin[:, None].to(torch.float32)
-    sb = sigma_bins[:, None]
-    gauss = torch.exp(-0.5 * ((idx - pb) / sb) ** 2)
-    att = 1.0 - (1.0 - cap[:, None]) * gauss
+    # Distance from peak in Hz, batch-wise
+    dist_hz = (f - f0.view(-1, 1)).abs()                   # [B,F]
 
-    Xf = X * att
-    x_f = torch.fft.irfft(Xf, n=T, dim=1)
-    return fmt(x_f)
+    # Gaussian profile around the tone
+    g = torch.exp(-(dist_hz * dist_hz) / (2.0 * (sigma_hz ** 2) + eps))  # [B,F], real
+
+    # Depth profile vs absolute frequency (in-band vs guard vs out-of-band)
+    f_abs = f.abs()
+    depth_in  = 10.0 ** (-max_depth_in  / 20.0)  # linear amplitude
+    depth_out = 10.0 ** (-max_depth_out / 20.0)
+
+    # Smooth transition across guard band
+    # s=0 at |f|<=inband_hz  -> depth_in
+    # s=1 at |f|>=inband_hz+guard_hz -> depth_out
+    if guard_hz > 0:
+        s = smoothstep01((f_abs - inband_hz) / max(guard_hz, eps))        # [B,F]
+        depth_prof = depth_in + (depth_out - depth_in) * s                 # [B,F]
+    else:
+        depth_prof = torch.full_like(f, depth_out)
+        depth_prof[f_abs <= inband_hz] = depth_in
+
+    # Final notch gain (real, 0..1), cast to complex for multiply
+    notch_gain_real = 1.0 - (1.0 - depth_prof) * g                         # [B,F] real
+    notch_gain = notch_gain_real.to(dtype=X.dtype)                          # complex dtype
+
+    Xn = X * notch_gain
+
+    # Inverse FFT back
+    if is_complex_in:
+        y = torch.fft.ifft(Xn, n=T, dim=1)      # complex time-domain
+    else:
+        y = torch.fft.irfft(Xn, n=T, dim=1)     # real time-domain
+
+    return fmt(y)
+
 
 def apply_prefilter(x: torch.Tensor, fs: float, prefilter: str,
                     inband_hz: Union[float, Sequence[float]] = 0.0, guard_hz: float = 0.0,

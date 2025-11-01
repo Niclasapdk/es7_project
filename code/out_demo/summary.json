@@ -1,0 +1,21 @@
+{
+  "input_mode": "dualpath",
+  "prefilter": "notch",
+  "inband_hz": 2046000.0,
+  "guard_hz": 2300000.0,
+  "core_rms": 5.0792741775512695,
+  "base_rms": 16.74251365661621,
+  "metrics": {
+    "EVM_pct": 1211.2829976883017,
+    "EVM_aligned_pct": 1452.7483430391894,
+    "SNR_in_dB": -26.0423678242884,
+    "SNR_out_dB": -23.243807577126553
+  },
+  "outputs": {
+    "time_real": "out_demo\\time_real.png",
+    "time_imag": "out_demo\\time_imag.png",
+    "time_mag": "out_demo\\time_mag.png",
+    "psd_compare": "out_demo\\psd_compare.png",
+    "time_segment_npz": "out_demo\\time_segment.npz"
+  }
+}

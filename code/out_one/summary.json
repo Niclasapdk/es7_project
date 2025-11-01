@@ -1,0 +1,25 @@
+{
+  "normalize": true,
+  "input_mode": "dualpath",
+  "prefilter": "notch",
+  "inband_hz": 2046000.0,
+  "guard_hz": 2300000.0,
+  "core_rms": 4.053136825561523,
+  "base_rms": 5.863290309906006,
+  "metrics_aligned": {
+    "EVM_pct": 95.21827417698586,
+    "SNR_in_dB": -15.234770154040365,
+    "SNR_out_dB": 0.42559388680466276,
+    "dSNR_dB": 15.660364040845028,
+    "delay_samples": 0.0,
+    "alpha_mag": 0.12572175383137052,
+    "alpha_deg": -0.48030649888688365
+  },
+  "outputs": {
+    "time_real": "out_one\\time_real.png",
+    "time_imag": "out_one\\time_imag.png",
+    "time_mag": "out_one\\time_mag.png",
+    "psd_compare": "out_one\\psd_compare.png",
+    "time_segment_npz": "out_one\\time_segment.npz"
+  }
+}
