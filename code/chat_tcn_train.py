@@ -73,33 +73,64 @@ def load_npz(path: str) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
 
 # ---------------- Notch prefilter ----------------
 @torch.no_grad()
-def notch_tonal_multi(x: torch.Tensor, fs: float, peaks: int = 2, q: float = 800.0, depth_db: float = 90.0) -> torch.Tensor:
-    """Simple frequency-domain multi-tone notch on complex IQ.
-    Finds 'peaks' largest spectral bins (excluding DC) and zeros a window of half-width ~T/q bins.
+# ---------------- Notch prefilter ----------------
+@torch.no_grad()
+def notch_tonal_multi(x: torch.Tensor,
+                      fs: float,
+                      peaks: int = 2,
+                      q: float = 800.0,
+                      depth_db: float = 90.0) -> torch.Tensor:
     """
-    def _as_complex(x):
-        if x.ndim==3 and x.shape[-1]==2:
-            z = torch.complex(x[...,0].float(), x[...,1].float()); back = lambda z: torch.stack([z.real,z.imag],-1)
-            return z, back
-        if torch.is_complex(x): return x, (lambda z:z)
-        xr = x.float(); return xr, (lambda z:z.real)
+    Frequency-domain multi-tone *soft* notch on complex IQ.
+    Finds 'peaks' largest spectral bins (excl. DC) and ATTENUATES a window
+    of half-width ~T/q bins around each peak up to depth_db (dB) at the center
+    with a raised-cosine taper back to 0 dB at the edges.
+    """
+    import math
 
-    z,back = _as_complex(x)
-    B,T = z.shape
-    X = torch.fft.fft(z, dim=1)  # [B,T]
+    def _as_complex(x_):
+        if x_.ndim == 3 and x_.shape[-1] == 2:
+            z = torch.complex(x_[..., 0].float(), x_[..., 1].float())
+            back = lambda z_: torch.stack([z_.real, z_.imag], dim=-1)
+            return z, back
+        if torch.is_complex(x_):
+            return x_, (lambda z_: z_)
+        xr = x_.float()
+        return xr, (lambda z_: z_.real)
+
+    z, back = _as_complex(x)
+    B, T = z.shape
+    X = torch.fft.fft(z, dim=1)            # [B,T], complex
     mag = X.abs()
-    mag[:,0] = 0.0  # ignore DC
-    half = max(1, int(T/max(1.0,q)))
-    for _ in range(max(0,int(peaks))):
-        idx = torch.argmax(mag, dim=1)  # [B]
+    mag[:, 0] = 0.0                        # ignore DC
+
+    # Build multiplicative mask (1 = pass, a = depth at center)
+    M = torch.ones_like(X, dtype=X.real.dtype)
+    half = max(1, int(T / max(1.0, q)))    # half-window in bins
+    a = float(10.0 ** (-depth_db / 20.0))  # linear gain at peak
+
+    peaks = max(0, int(peaks))
+    for _ in range(peaks):
+        idx = torch.argmax(mag, dim=1)     # [B]
+        # Zero out this region in 'mag' so we don't re-pick it next iteration
         for b in range(B):
             k = int(idx[b].item())
-            rng = [(k+o) % T for o in range(-half, half+1)]
-            X[b, rng] = 0
+            for center in (k, (-k) % T):   # handle ±k like before
+                for o in range(-half, half + 1):
+                    t = abs(o) / float(half)
+                    # raised-cosine from 'a' at center to 1.0 at edges
+                    g = a + (1.0 - a) * (1.0 - math.cos(math.pi * t)) * 0.5
+                    j = (center + o) % T
+                    # elementwise min so total attenuation never exceeds 'a'
+                    M[b, j] = torch.minimum(M[b, j], torch.tensor(g, device=M.device, dtype=M.dtype))
+            # also suppress the region in 'mag' to avoid reselecting
+            rng = [(k + o) % T for o in range(-half, half + 1)]
+            mag[b, rng] = 0.0
             k2 = (-k) % T
-            rng2 = [(k2+o) % T for o in range(-half, half+1)]
-            X[b, rng2] = 0
-        mag[:, idx] = 0.0
+            rng2 = [(k2 + o) % T for o in range(-half, half + 1)]
+            mag[b, rng2] = 0.0
+
+    X = X * M                              # apply soft notch
     zf = torch.fft.ifft(X, dim=1)
     return back(zf)
 
