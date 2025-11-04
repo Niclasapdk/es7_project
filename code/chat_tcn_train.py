@@ -218,7 +218,7 @@ class CompositeLoss(nn.Module):
     def _frac_delay(z: torch.Tensor, fs: float, tau: float) -> torch.Tensor:
         # z: [B,T] complex. Apply fractional delay tau (samples) via FFT phase ramp.
         B,T = z.shape
-        W = 2.0*math.pi*torch.fft.fftfreq(T, d=1.0/fs).to(z.device)
+        W = 2.0*math.pi*torch.fft.fftfreq(T, d=1.0).to(z.device)
         Z = torch.fft.fft(z, dim=1)
         phase = torch.exp(-1j*W * tau).unsqueeze(0)
         Zs = Z * phase
@@ -344,7 +344,7 @@ def align_best_frac_gain(y_pred_iq: torch.Tensor, y_true_iq: torch.Tensor,
     yp = torch.complex(y_pred_iq[...,0], y_pred_iq[...,1])
     yt = torch.complex(y_true_iq[...,0], y_true_iq[...,1])
     def frac_delay(z, tau):
-        W = 2.0*math.pi*torch.fft.fftfreq(T, d=1.0/fs).to(z.device)
+        W = 2.0*math.pi*torch.fft.fftfreq(T, d=1.0).to(z.device)
         Z = torch.fft.fft(z, dim=1)
         phase = torch.exp(-1j*W * tau).unsqueeze(0)
         return torch.fft.ifft(Z*phase, dim=1)
