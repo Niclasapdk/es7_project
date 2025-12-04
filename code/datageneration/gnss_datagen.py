@@ -255,22 +255,37 @@ def pulsed_tone_jammer(
     return (tone * gate.astype(np.complex64)).astype(np.complex64)
 
 
-def add_awgn(x: np.ndarray, snr_db: float, rng: np.random.Generator) -> np.ndarray:
+def add_awgn(x: np.ndarray,
+             snr_db: float,
+             rng: np.random.Generator,
+             p_sig_ref: Optional[float] = None) -> np.ndarray:
     """
-    Add circularly symmetric complex AWGN to achieve target SNR (per-block, with respect to x's power).
+    Add circularly symmetric complex AWGN to achieve target SNR on a reference signal power.
+
+    Parameters
+    ----------
+    x : np.ndarray[complex]
+        Input block to which noise will be added.
+    snr_db : float
+        Target SNR in dB, defined as P_ref / P_noise.
+    rng : np.random.Generator
+        Random generator for the noise.
+    p_sig_ref : Optional[float]
+        Reference signal power P_ref. If None, P_ref is taken as the power of x.
 
     Note
     ----
-    - SNR is defined here as P_signal / P_noise on the input vector.
-    - Noise is i.i.d. complex Gaussian (σ^2 per complex dim = P_noise).
+    - SNR is defined here as P_ref / P_noise.
+    - Noise is i.i.d. circular complex Gaussian (σ^2 per complex dim = P_noise).
     """
-    p_sig = np.mean(np.abs(x.astype(np.complex128))**2).real
+    if p_sig_ref is None:
+        p_sig_ref = np.mean(np.abs(x.astype(np.complex128))**2).real
+
     snr_lin = 10.0 ** (snr_db / 10.0)
-    p_noise = p_sig / snr_lin
+    p_noise = p_sig_ref / snr_lin
     sigma = math.sqrt(p_noise / 2.0)                # per real/imag component
     n = (rng.normal(0.0, sigma, x.shape) + 1j * rng.normal(0.0, sigma, x.shape)).astype(np.complex64)
     return (x + n).astype(np.complex64)
-
 
 def mix_jammer(x_sig: np.ndarray, jam: np.ndarray, jsr_db: float) -> np.ndarray:
     """
@@ -352,7 +367,13 @@ def gen_split(
         fd = float(rng.uniform(-doppler_max_hz, doppler_max_hz))
 
         # Clean signal (target)
+        # Clean signal (target)
         clean = synthesize_block(fs, block_len, prn, sps, fd, rng)
+
+        # Reference clean-signal power used for both JSR (jammer scaling)
+        # and SNR (thermal noise level), so that AWGN level is independent
+        # of whether a jammer is present.
+        p_clean = np.mean(np.abs(clean.astype(np.complex128))**2).real
 
         observed = clean.copy()
 
@@ -389,9 +410,12 @@ def gen_split(
             else:
                 raise ValueError(f"Unknown jammer: {jammer}")
 
-        # Optional AWGN added to observed (X) only, keeping Y perfectly clean
+        # Add AWGN after jamming or on clean-only.
+        # SNR is defined w.r.t. the CLEAN signal power p_clean,
+        # so noise level does not depend on JSR.
         if snr_db is not None:
-            observed = add_awgn(observed, snr_db, rng)
+            observed = add_awgn(observed, snr_db, rng, p_sig_ref=p_clean)
+
 
         # Pack complex to float32 I/Q
         X[i, :, 0] = observed.real.astype(np.float32)
