@@ -1,0 +1,19 @@
+python gnss_datagen.py \
+  --out artifacts/gnss_l1_uav_sweptcw_snr15_jsr-10_20_500k.npz \
+  --n-train 450000 \
+  --n-val 25000 \
+  --n-test 25000 \
+  --block-ms 1.0 \
+  --fs 4.092e6 \
+  --prn-low 1 --prn-high 32 \
+  --doppler-max-hz 5000 \
+  --snr-db 15 \
+  --jammer swept_cw \
+  --jsr-min -10 --jsr-max 20 \
+  --jam-f0-min -3.5e5 \
+  --jam-f0-max  3.5e5 \
+  --jam-bw-min 2.0e5 \
+  --jam-bw-max 8.0e5 \
+  --jam-sweep-ms-min 1.0 \
+  --jam-sweep-ms-max 10.0 \
+  --seed 1337
