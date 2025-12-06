@@ -1,60 +1,80 @@
 #!/usr/bin/env python3
-# Train a causal TCN denoiser on I/Q with a fixed notch prefilter (residual scheme).
-# This build includes:
-# - AMP 2.0 API
-# - Spec-weight ramp (fixed to keep final value)
-# - Optional fractional-delay + gain alignment in the loss
-# - Optional Top-K spectral peak emphasis
-# - Optional per-seq RMS norm
-# - EMA
-# - Cosine or CAWR scheduler
-# - DDP support
-# - QUIET aligned,in-band EVM diagnostic with --diag-ai-evm {off,epoch,batch}
+"""
+Notch + Residual TCN jammer-denoiser training script
 
-from __future__ import annotations
-import os, math, time, argparse, warnings
+Features:
+- DDP (torchrun) support
+- AMP 2.0 (torch.amp.autocast / GradScaler('cuda', ...))
+- Multi-tone soft notch prefilter
+- Composite loss: time-domain, spectral, smoothness, optional alignment & peak emphasis
+- Optional per-window RMS normalization
+- Optional curriculum learning (easy → hard based on SNR_in)
+- Cosine / CAWR schedulers with warmup
+- EMA weights
+- Validation SNR_in/out and EVM%, plus optional aligned in-band EVM diagnostics
+"""
+
+import argparse
+import os
+import time
 from pathlib import Path
-from typing import Tuple, Dict
+from typing import Dict, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.distributed as dist
+from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
 
-warnings.filterwarnings("ignore", category=FutureWarning, module="torch.cuda")
 
 # ---------------- I/Q helpers ----------------
+
 def ensure_iq(x: torch.Tensor) -> torch.Tensor:
-    if x.dtype != torch.float32: x = x.float()
+    """Ensure tensor is [B, T, 2] float IQ."""
     if x.ndim != 3 or x.shape[-1] != 2:
-        raise RuntimeError(f"Expected [B,T,2] IQ, got {tuple(x.shape)}")
-    return x.contiguous()
+        raise RuntimeError(f"Expected [B, T, 2] IQ tensor, got shape {tuple(x.shape)}")
+    return x
+
 
 def complex_from_iq(x: torch.Tensor) -> torch.Tensor:
+    """Convert [B, T, 2] → complex [B, T]."""
     x = ensure_iq(x)
-    return torch.complex(x[...,0], x[...,1])
+    return torch.complex(x[..., 0], x[..., 1])
+
 
 def iq_from_complex(z: torch.Tensor) -> torch.Tensor:
-    if not torch.is_complex(z): raise RuntimeError("Expected complex")
+    """Convert complex [B, T] → [B, T, 2]."""
     return torch.stack([z.real, z.imag], dim=-1)
 
+
 # ---------------- optional per-sequence normalization ----------------
+
 def perseq_rms_norm(x_iq: torch.Tensor, y_iq: torch.Tensor, eps: float = 1e-8):
-    """Normalize both input and target by target RMS per sequence. x_iq,y_iq: [B,T,2]"""
-    yr = y_iq[...,0]; yi = y_iq[...,1]
-    rms = torch.sqrt((yr**2 + yi**2).mean(dim=1, keepdim=True).clamp_min(eps))  # [B,1]
-    rms = rms.unsqueeze(-1)  # [B,1,1]
+    """
+    Normalize both input and target by target RMS per sequence.
+    x_iq, y_iq: [B, T, 2]
+    """
+    y_iq = ensure_iq(y_iq)
+    yr = y_iq[..., 0]
+    yi = y_iq[..., 1]
+    rms = torch.sqrt((yr ** 2 + yi ** 2).mean(dim=1, keepdim=True).clamp_min(eps))  # [B, 1]
+    rms = rms.unsqueeze(-1)  # [B, 1, 1]
     return x_iq / rms, y_iq / rms
 
+
 # ---------------- Dataset ----------------
+
 class IQWindows(Dataset):
     def __init__(self, X: np.ndarray, Y: np.ndarray):
-        assert X.shape == Y.shape and X.ndim == 3 and X.shape[-1] == 2, f"Bad shapes {X.shape} vs {Y.shape}"
-        self.X = X.astype(np.float32); self.Y = Y.astype(np.float32)
-    def __len__(self): return self.X.shape[0]
+        assert X.shape == Y.shape and X.ndim == 3 and X.shape[-1] == 2, \
+            f"Bad shapes {X.shape} vs {Y.shape}"
+        self.X = X.astype(np.float32)
+        self.Y = Y.astype(np.float32)
+
+    def __len__(self):
+        return self.X.shape[0]
+
     def __getitem__(self, i: int):
         return torch.from_numpy(self.X[i]), torch.from_numpy(self.Y[i])
 
@@ -66,16 +86,15 @@ def compute_curriculum_difficulty_from_xy(X: np.ndarray, Y: np.ndarray) -> np.nd
     X, Y: [N, T, 2] float arrays.
     """
     assert X.shape == Y.shape and X.ndim == 3 and X.shape[-1] == 2
-    # Use float64 for accumulation
     x = X.astype(np.float64)
     y = Y.astype(np.float64)
 
     # Signal power: mean(|Y|^2) over time
-    sig_pow = (y[..., 0]**2 + y[..., 1]**2).mean(axis=1)
+    sig_pow = (y[..., 0] ** 2 + y[..., 1] ** 2).mean(axis=1)
 
     # Interference+noise power: mean(|X-Y|^2) over time
     e = x - y
-    in_pow = (e[..., 0]**2 + e[..., 1]**2).mean(axis=1)
+    in_pow = (e[..., 0] ** 2 + e[..., 1] ** 2).mean(axis=1)
 
     eps = 1e-12
     in_pow = np.maximum(in_pow, eps)
@@ -131,430 +150,623 @@ class IQWindowsCurriculum(Dataset):
         y = torch.from_numpy(self.Y[idx])
         return x, y
 
+
+# ---------------- NPZ loader ----------------
+
 def load_npz(path: str) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
     npz = np.load(path)
     k = set(npz.keys())
-    if {"Xtr","Ytr","Xva","Yva"}.issubset(k):
-        Xtr,Ytr,Xva,Yva = npz["Xtr"],npz["Ytr"],npz["Xva"],npz["Yva"]
-        mid = max(1, Xva.shape[0]//2)
-        return {"train":(Xtr,Ytr),"val":(Xva[:mid],Yva[:mid]),"test":(Xva[mid:],Yva[mid:])}
-    if {"X","Y"}.issubset(k):
-        X,Y = npz["X"], npz["Y"]
-        N = X.shape[0]; ntr=int(0.8*N); nva=int(0.1*N)
-        return {"train":(X[:ntr],Y[:ntr]), "val":(X[ntr:ntr+nva],Y[ntr:ntr+nva]), "test":(X[ntr+nva:],Y[ntr+nva:])}
-    raise ValueError(f"Unexpected keys in {path}: {sorted(k)}")
 
-# ---------------- Notch prefilter ----------------
-@torch.no_grad()
-# ---------------- Notch prefilter ----------------
-@torch.no_grad()
-def notch_tonal_multi(x: torch.Tensor,
-                      fs: float,
-                      peaks: int = 2,
-                      q: float = 800.0,
-                      depth_db: float = 90.0) -> torch.Tensor:
+    if {"Xtr", "Ytr", "Xva", "Yva"}.issubset(k):
+        Xtr = npz["Xtr"]
+        Ytr = npz["Ytr"]
+        Xva = npz["Xva"]
+        Yva = npz["Yva"]
+    elif {"Xtr", "Ytr"}.issubset(k):
+        Xtr = npz["Xtr"]
+        Ytr = npz["Ytr"]
+        if {"Xva", "Yva"}.issubset(k):
+            Xva = npz["Xva"]
+            Yva = npz["Yva"]
+        else:
+            # simple 90/10 split
+            N = Xtr.shape[0]
+            n_va = max(1, int(0.1 * N))
+            Xva, Yva = Xtr[-n_va:], Ytr[-n_va:]
+            Xtr, Ytr = Xtr[:-n_va], Ytr[:-n_va]
+    else:
+        # fallback: assume "X","Y"
+        X = npz["X"]
+        Y = npz["Y"]
+        N = X.shape[0]
+        n_va = max(1, int(0.1 * N))
+        Xtr, Ytr = X[:-n_va], Y[:-n_va]
+        Xva, Yva = X[-n_va:], Y[-n_va:]
+
+    return {"train": (Xtr, Ytr), "val": (Xva, Yva)}
+
+
+# ---------------- notch helper ----------------
+
+def _as_complex(x: torch.Tensor) -> torch.Tensor:
+    """Interpret a real tensor as complex if needed."""
+    if torch.is_complex(x):
+        return x
+    if x.ndim == 1:
+        return torch.complex(x, torch.zeros_like(x))
+    if x.ndim == 2:
+        # [T,2] or [B,T]?
+        if x.shape[-1] == 2:
+            return torch.complex(x[..., 0], x[..., 1])
+    raise RuntimeError(f"Cannot interpret tensor of shape {x.shape} as complex.")
+
+
+def notch_tonal_multi(x_iq: torch.Tensor, fs: float,
+                      peaks: int = 2, q: float = 800.0, depth_db: float = 90.0) -> torch.Tensor:
     """
-    Frequency-domain multi-tone *soft* notch on complex IQ.
-    Finds 'peaks' largest spectral bins (excl. DC) and ATTENUATES a window
-    of half-width ~T/q bins around each peak up to depth_db (dB) at the center
-    with a raised-cosine taper back to 0 dB at the edges.
+    Very simple frequency-domain "soft" multi-tone notch.
+    - x_iq: [B, T, 2]
+    - fs: sampling rate
+    - peaks: number of tones to notch (uses average spectrum over batch)
+    - q: quality factor (approx controls width)
+    - depth_db: attenuation at tone center (in dB)
     """
-    import math
+    x_iq = ensure_iq(x_iq)
+    z = complex_from_iq(x_iq)              # [B, T]
+    B, T = z.shape
+    X = torch.fft.fft(z, dim=1)           # [B, T]
+    freqs = torch.fft.fftfreq(T, d=1.0 / fs).to(X.device)
 
-    def _as_complex(x_):
-        if x_.ndim == 3 and x_.shape[-1] == 2:
-            z = torch.complex(x_[..., 0].float(), x_[..., 1].float())
-            back = lambda z_: torch.stack([z_.real, z_.imag], dim=-1)
-            return z, back
-        if torch.is_complex(x_):
-            return x_, torch.view_as_real
-        raise RuntimeError(f"Unsupported x shape {tuple(x_.shape)}")
+    # Use average magnitude spectrum to locate main peaks (ignore DC).
+    mag = X.abs().mean(dim=0)             # [T]
+    # ignore (very near) DC when searching for tonal peaks
+    dc_mask = (freqs.abs() < (fs / (10 * T)))  # ~1 bin around DC
+    mag_for_peaks = mag.clone()
+    mag_for_peaks[dc_mask] = 0.0
 
-    z, back = _as_complex(x)             # [B,T]
-    B,T = z.shape
-    X = torch.fft.fft(z, dim=1)          # [B,T]
-    mag = X.abs()                        # [B,T]
+    k_peaks = min(peaks, T - 1)
+    if k_peaks <= 0:
+        return x_iq
 
-    # ignore DC
-    mag[:, 0] = 0.0
+    peak_indices = torch.topk(mag_for_peaks, k=k_peaks, dim=-1).indices
 
-    # Build multiplicative mask (1 = pass, a = depth at center)
-    M = torch.ones_like(X, dtype=X.real.dtype)
-    half = max(1, int(T / max(1.0, q)))    # half-window in bins
-    a = float(10.0 ** (-depth_db / 20.0))  # linear gain at peak
+    # Build soft notch mask in frequency domain
+    depth_lin = 10.0 ** (-depth_db / 20.0)  # amplitude ratio
+    notch_mask = torch.ones_like(X)
 
-    peaks = max(0, int(peaks))
-    for _ in range(peaks):
-        idx = torch.argmax(mag, dim=1)     # [B]
-        # Zero out this region in 'mag' so we don't re-pick it next iteration
-        for b in range(B):
-            k = int(idx[b].item())
-            for center in (k, (-k) % T):   # handle ±k like before
-                for o in range(-half, half + 1):
-                    t = abs(o) / float(half)
-                    # raised-cosine from 'a' at center to 1.0 at edges
-                    g = a + (1.0 - a) * (1.0 - math.cos(math.pi * t)) * 0.5
-                    j = (center + o) % T
-                    # elementwise min so total attenuation never exceeds 'a'
-                    M[b, j] = torch.minimum(M[b, j], torch.tensor(g, device=M.device, dtype=M.dtype))
-            # also suppress the region in 'mag' to avoid reselecting
-            rng = [(k + o) % T for o in range(-half, half + 1)]
-            mag[b, rng] = 0.0
-            k2 = (-k) % T
-            rng2 = [(k2 + o) % T for o in range(-half, half + 1)]
-            mag[b, rng2] = 0.0
+    for idx in peak_indices:
+        f0 = freqs[idx]
+        # crude bandwidth from "Q" definition: bw ≈ f0 / q (but ensure non-zero)
+        bw = (torch.abs(f0) / max(q, 1.0)).clamp(min=fs / T)
+        # Gaussian-ish shape around f0
+        w = torch.exp(-0.5 * ((freqs - f0) / bw) ** 2)
+        # convert to attenuation factor between depth_lin (at center) and 1.0 (far away)
+        att = depth_lin + (1.0 - depth_lin) * (1.0 - w)
+        notch_mask = notch_mask * att[None, :]
 
-    X = X * M                              # apply soft notch
-    zf = torch.fft.ifft(X, dim=1)
-    return back(zf)
+    Y = X * notch_mask
+    y = torch.fft.ifft(Y, dim=1)
+    return iq_from_complex(y)
 
-# ---------------- Model ----------------
+
+# ---------------- short helpers for bandlimits / losses ----------------
+
+def bandlimit_inband(x_iq: torch.Tensor, fs: float, inband: float, guard: float) -> torch.Tensor:
+    """
+    Return in-band part (optionally with DC-guard removed) of x_iq.
+    """
+    x_iq = ensure_iq(x_iq)
+    z = complex_from_iq(x_iq)            # [B, T]
+    B, T = z.shape
+    X = torch.fft.fft(z, dim=1)
+    freqs = torch.fft.fftfreq(T, d=1.0 / fs).to(X.device)
+
+    f_in = inband / 2.0
+    mask = (freqs >= -f_in) & (freqs <= f_in)
+
+    if guard > 0.0:
+        g = guard
+        mask_guard = (freqs >= -g) & (freqs <= g)
+        mask = mask & ~mask_guard
+
+    Xb = torch.where(mask[None, :], X, torch.zeros_like(X))
+    zb = torch.fft.ifft(Xb, dim=1)
+    return iq_from_complex(zb)
+
+
+def spectral_loss(y_true_iq: torch.Tensor,
+                  y_pred_iq: torch.Tensor,
+                  fs: float,
+                  inband: float,
+                  guard: float,
+                  w_in: float = 1.0,
+                  w_guard: float = 1.0,
+                  w_out: float = 1.0) -> torch.Tensor:
+    """
+    L1 loss on magnitude spectra, with weights on in-band / guard / out-of-band.
+    """
+    y_true_iq = ensure_iq(y_true_iq)
+    y_pred_iq = ensure_iq(y_pred_iq)
+    yt = complex_from_iq(y_true_iq)
+    yp = complex_from_iq(y_pred_iq)
+    B, T = yt.shape
+
+    Yt = torch.fft.fft(yt, dim=1)
+    Yp = torch.fft.fft(yp, dim=1)
+    freqs = torch.fft.fftfreq(T, d=1.0 / fs).to(yt.device)
+
+    mag_t = Yt.abs()
+    mag_p = Yp.abs()
+    diff = (mag_p - mag_t).abs()         # [B, T]
+
+    f_in = inband / 2.0
+    mask_in = (freqs >= -f_in) & (freqs <= f_in)
+    if guard > 0.0:
+        mask_guard = (freqs >= -guard) & (freqs <= guard)
+        mask_inband = mask_in & ~mask_guard
+    else:
+        mask_guard = torch.zeros_like(mask_in, dtype=torch.bool)
+        mask_inband = mask_in
+
+    mask_out = ~mask_in
+
+    loss = 0.0
+    if w_in > 0.0 and mask_inband.any():
+        loss = loss + w_in * diff[:, mask_inband].mean()
+    if w_guard > 0.0 and mask_guard.any():
+        loss = loss + w_guard * diff[:, mask_guard].mean()
+    if w_out > 0.0 and mask_out.any():
+        loss = loss + w_out * diff[:, mask_out].mean()
+
+    return loss
+
+
+def first_diff_loss(y_true_iq: torch.Tensor,
+                    y_pred_iq: torch.Tensor) -> torch.Tensor:
+    """
+    First-difference (discrete derivative) L1 loss between true and predicted IQ.
+    """
+    y_true_iq = ensure_iq(y_true_iq)
+    y_pred_iq = ensure_iq(y_pred_iq)
+    dt_true = y_true_iq[:, 1:, :] - y_true_iq[:, :-1, :]
+    dt_pred = y_pred_iq[:, 1:, :] - y_pred_iq[:, :-1, :]
+    return (dt_pred - dt_true).abs().mean()
+
+
+# ---------------- Model: Residual TCN ----------------
+
 class CausalConv1d(nn.Conv1d):
-    def __init__(self, in_ch, out_ch, kernel_size, dilation=1):
-        pad = (kernel_size - 1) * dilation
-        super().__init__(in_ch, out_ch, kernel_size, padding=pad, dilation=dilation)
-    def forward(self, x):
-        y = super().forward(x)
-        k = self.kernel_size[0]
-        d = self.dilation[0]
-        cut = (k-1)*d
-        if cut>0: y = y[...,:-cut]
-        return y
+    """1-D causal conv implemented via left padding and trimming."""
+    def __init__(self, in_ch: int, out_ch: int, k: int, dilation: int = 1):
+        pad = (k - 1) * dilation
+        super().__init__(in_ch, out_ch, kernel_size=k, padding=pad, dilation=dilation)
+        self._pad = pad
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        if self._pad > 0:
+            return out[..., :-self._pad]
+        return out
+
 
 class TCNBlock(nn.Module):
-    def __init__(self, ch, k, d, dropout=0.0):
+    def __init__(self, ch: int, k: int, dilation: int, dropout: float):
         super().__init__()
-        self.conv1 = CausalConv1d(ch, ch, k, dilation=d)
-        self.conv2 = CausalConv1d(ch, ch, k, dilation=d)
-        self.drop = nn.Dropout(dropout)
+        self.conv1 = CausalConv1d(ch, ch, k, dilation=dilation)
         self.bn1 = nn.BatchNorm1d(ch)
+        self.act1 = nn.GELU()
+        self.conv2 = CausalConv1d(ch, ch, k, dilation=dilation)
         self.bn2 = nn.BatchNorm1d(ch)
-        self.act = nn.ReLU()
-    def forward(self, x):
+        self.act2 = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.conv1(x)
         y = self.bn1(y)
-        y = self.act(y)
-        y = self.drop(y)
+        y = self.act1(y)
+        y = self.dropout(y)
         y = self.conv2(y)
         y = self.bn2(y)
-        y = self.act(y)
-        y = self.drop(y)
+        y = self.act2(y)
         return x + y
 
-class TCN(nn.Module):
-    def __init__(self, in_ch, hid, blocks, k, dropout):
+
+class ResidualTCN(nn.Module):
+    """
+    Simple residual TCN:
+      input: [B, C_in, T]
+      output: [B, 2, T] (IQ residual)
+    """
+    def __init__(self, in_ch: int, hid: int, blocks: int, k: int, dropout: float):
         super().__init__()
-        self.in_proj = CausalConv1d(in_ch, hid, 1)
-        layers=[]
-        d=1
+        self.in_proj = nn.Conv1d(in_ch, hid, kernel_size=1)
+        layers = []
+        dilation = 1
         for _ in range(blocks):
-            layers.append(TCNBlock(hid, k, d, dropout))
-            d*=2
+            layers.append(TCNBlock(hid, k, dilation=dilation, dropout=dropout))
+            dilation *= 2
         self.tcn = nn.Sequential(*layers)
-        self.out_proj = CausalConv1d(hid, 2, 1)
-    def forward(self, x):
-        # x: [B,C,T]
+        self.out_proj = nn.Conv1d(hid, 2, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.in_proj(x)
         h = self.tcn(h)
-        y = self.out_proj(h)
-        return y
+        out = self.out_proj(h)
+        return out
 
-def make_model(in_ch=4, hid=64, blocks=8, k=7, dropout=0.05) -> nn.Module:
-    return TCN(in_ch, hid, blocks, k, dropout)
 
-# ---------------- Losses ----------------
-def bandlimit_inband(x_iq: torch.Tensor, fs: float, inband_hz: float, guard_hz: float) -> torch.Tensor:
-    z = complex_from_iq(x_iq)        # [B,T]
-    B,T = z.shape
-    Z = torch.fft.fft(z, dim=1)     # [B,T]
-    freqs = torch.fft.fftfreq(T, d=1.0/fs).to(z.device)  # [-fs/2,fs/2)
-    Zs = torch.fft.fftshift(Z, dim=1); freqs = torch.fft.fftshift(freqs)
-    BW = inband_hz
-    m_in = (freqs >= -BW/2) & (freqs <= +BW/2)
-    Zs = Zs * m_in
-    Z = torch.fft.ifftshift(Zs, dim=1)
-    zf = torch.fft.ifft(Z, dim=1)
-    return iq_from_complex(zf)
+# ---------------- Alignment helpers & EVM/SNR metrics ----------------
 
-def spectral_loss(y_true: torch.Tensor, y_pred: torch.Tensor, fs: float,
-                  inband_hz: float, guard_hz: float,
-                  w_in: float=1.0, w_guard: float=1.0, w_out: float=1.0) -> torch.Tensor:
-    """Region-weighted L1 spectrum error over full band."""
-    yt = complex_from_iq(y_true); yp = complex_from_iq(y_pred)
-    B,T = yt.shape
-    Yt = torch.fft.fft(yt, dim=1); Yp = torch.fft.fft(yp, dim=1)
-    freqs = torch.fft.fftfreq(T, d=1.0/fs).to(yt.device)  # [-fs/2, fs/2)
-    Yt = torch.fft.fftshift(Yt, dim=1); Yp = torch.fft.fftshift(Yp, dim=1); freqs = torch.fft.fftshift(freqs)
-    BW = inband_hz
-    m_in    = (freqs >= -BW/2) & (freqs <= +BW/2)
-    m_guard = ((freqs > +BW/2) & (freqs <= +BW/2+guard_hz)) | ((freqs < -BW/2) & (freqs >= -BW/2-guard_hz))
-    m_out   = ~(m_in | m_guard)
-    err = (Yp - Yt).abs()
-    return (w_in*err[:,m_in].mean() + w_guard*err[:,m_guard].mean() + w_out*err[:,m_out].mean())
+@torch.no_grad()
+def align_best_frac_gain(y_pred_iq: torch.Tensor,
+                         y_true_iq: torch.Tensor,
+                         fs: float,
+                         maxlag: int,
+                         frac_steps: int,
+                         gain_align: bool) -> torch.Tensor:
+    """
+    Simple integer-lag alignment + optional complex gain per sequence.
+    frac_steps is currently ignored, but kept for API compatibility.
+    """
+    del fs  # unused in this simplified version
+    del frac_steps
 
-def first_diff_loss(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
-    dy = y_pred[:,1:,:] - y_pred[:,:-1,:]
-    return dy.abs().mean()
+    y_pred_iq = ensure_iq(y_pred_iq)
+    y_true_iq = ensure_iq(y_true_iq)
+    zp = complex_from_iq(y_pred_iq)
+    zt = complex_from_iq(y_true_iq)
+    B, T = zp.shape
+    device = zp.device
+
+    if maxlag <= 0:
+        return y_pred_iq
+
+    lags = range(-maxlag, maxlag + 1)
+    eps = 1e-12
+
+    best_err = None
+    best_aligned = None
+
+    for lag in lags:
+        if lag >= 0:
+            zp_seg = zp[:, lag:]
+            zt_seg = zt[:, :T - lag]
+        else:
+            zp_seg = zp[:, :T + lag]
+            zt_seg = zt[:, -lag:]
+
+        if gain_align:
+            num = (zp_seg.conj() * zt_seg).sum(dim=1)
+            den = (zp_seg.conj() * zp_seg).sum(dim=1).clamp_min(eps)
+            g = num / den  # [B]
+            zp_aligned_seg = g[:, None] * zp_seg
+        else:
+            zp_aligned_seg = zp_seg
+
+        # pad back to length T
+        zp_full = torch.zeros_like(zp)
+        if lag >= 0:
+            zp_full[:, :T - lag] = zp_aligned_seg
+        else:
+            zp_full[:, -lag:] = zp_aligned_seg
+
+        err = ((zp_full - zt).abs() ** 2).mean(dim=1)  # [B]
+
+        if best_err is None:
+            best_err = err
+            best_aligned = zp_full
+        else:
+            mask = err < best_err
+            best_err = torch.minimum(best_err, err)
+            best_aligned = torch.where(mask[:, None], zp_full, best_aligned)
+
+    return iq_from_complex(best_aligned)
+
+
+@torch.no_grad()
+def snr_in_out_raw(x_iq: torch.Tensor,
+                   y_true_iq: torch.Tensor,
+                   y_pred_iq: torch.Tensor,
+                   eps: float = 1e-12):
+    """
+    Compute SNR_in and SNR_out in dB, using mean(|y|^2) / mean(|err|^2).
+    """
+    x = complex_from_iq(x_iq)
+    y = complex_from_iq(y_true_iq)
+    yhat = complex_from_iq(y_pred_iq)
+
+    sig_pow = (y.abs() ** 2).mean(dim=1).clamp_min(eps)
+    in_err_pow = (x - y).abs().pow(2).mean(dim=1).clamp_min(eps)
+    out_err_pow = (yhat - y).abs().pow(2).mean(dim=1).clamp_min(eps)
+
+    snr_in = 10.0 * torch.log10(sig_pow / in_err_pow).mean().item()
+    snr_out = 10.0 * torch.log10(sig_pow / out_err_pow).mean().item()
+    return snr_in, snr_out
+
+
+@torch.no_grad()
+def evm_rms_pct_raw(y_true_iq: torch.Tensor,
+                    y_pred_iq: torch.Tensor,
+                    eps: float = 1e-12) -> float:
+    """
+    Root-mean-square EVM (%) ignoring bandlimits / alignment.
+    """
+    yt = complex_from_iq(y_true_iq)
+    yp = complex_from_iq(y_pred_iq)
+
+    err_pow = (yp - yt).abs().pow(2).mean(dim=1).clamp_min(eps)
+    ref_pow = yt.abs().pow(2).mean(dim=1).clamp_min(eps)
+    evm = torch.sqrt(err_pow / ref_pow).mean()
+    return 100.0 * evm.item()
+
+
+@torch.no_grad()
+def evm_aligned_inband_pct(y_true: torch.Tensor,
+                           y_pred: torch.Tensor,
+                           fs: float,
+                           inband: float,
+                           guard: float,
+                           maxlag: int = 12,
+                           frac_steps: int = 5,
+                           gain_align: bool = True) -> float:
+    """
+    RMS EVM (%) after:
+      1) best integer-lag + gain alignment
+      2) bandlimiting to inband (with guard)
+    """
+    y_pred_al = align_best_frac_gain(y_pred, y_true, fs, maxlag, frac_steps, gain_align)
+    yt_in = bandlimit_inband(y_true, fs, inband, guard)
+    yp_in = bandlimit_inband(y_pred_al, fs, inband, guard)
+    yt = complex_from_iq(yt_in)
+    yp = complex_from_iq(yp_in)
+
+    err_pow = ((yp - yt).abs() ** 2).mean(dim=1).clamp_min(1e-12)
+    ref_pow = (yt.abs() ** 2).mean(dim=1).clamp_min(1e-12)
+    return 100.0 * torch.sqrt(err_pow / ref_pow).mean().item()
+
+
+# ---------------- Composite loss ----------------
 
 class CompositeLoss(nn.Module):
-    def __init__(self, fs, inband_hz, guard_hz,
-                 spec_w=0.3, w_in=1.0, w_guard=1.0, w_out=1.0,
-                 smooth_w=0.05, time_w=1.0,
-                 align_maxlag: int = 0, align_w: float = 0.0, gain_align: bool = False,
+    def __init__(self,
+                 fs: float,
+                 inband: float,
+                 guard: float,
+                 spec_w: float = 0.3,
+                 w_in: float = 1.0,
+                 w_guard: float = 1.0,
+                 w_out: float = 1.0,
+                 smooth_w: float = 0.05,
+                 time_w: float = 1.0,
+                 align_maxlag: int = 0,
+                 align_w: float = 0.0,
+                 gain_align: bool = False,
                  align_frac_steps: int = 0,
-                 peak_w: float = 0.0, peak_k: int = 0, peak_region: str = "guard"):
+                 peak_w: float = 0.0,
+                 peak_k: int = 0,
+                 peak_region: str = "guard"):
         super().__init__()
-        self.fs = fs
-        self.inband_hz = inband_hz
-        self.guard_hz = guard_hz
+        self.fs = float(fs)
+        self.inband = float(inband)
+        self.guard = float(guard)
         self.spec_w = float(spec_w)
         self.w_in = float(w_in)
         self.w_guard = float(w_guard)
         self.w_out = float(w_out)
         self.smooth_w = float(smooth_w)
         self.time_w = float(time_w)
-        self.align_maxlag = int(max(0, align_maxlag))
-        self.align_w = float(max(0.0, align_w))
+        self.align_maxlag = int(align_maxlag)
+        self.align_w = float(align_w)
         self.gain_align = bool(gain_align)
-        self.align_frac_steps = int(max(0, align_frac_steps))
-        self.peak_w = float(max(0.0, peak_w))
-        self.peak_k = int(max(0, peak_k))
-        assert peak_region in ("guard","in","both")
-        self.peak_region = peak_region
+        self.align_frac_steps = int(align_frac_steps)
+        self.peak_w = float(peak_w)
+        self.peak_k = int(peak_k)
+        self.peak_region = str(peak_region)
 
-    def set_spec_weight(self, w: float): self.spec_w = float(max(0.0, w))
-
-    @staticmethod
-    def _frac_delay(z: torch.Tensor, fs: float, tau: float) -> torch.Tensor:
-        # z: [B,T] complex. Apply fractional delay tau (samples) via FFT phase ramp.
-        B,T = z.shape
-        W = 2.0*math.pi*torch.fft.fftfreq(T, d=1.0).to(z.device)
-        Z = torch.fft.fft(z, dim=1)
-        phase = torch.exp(-1j*W * tau).unsqueeze(0)
-        Zs = Z * phase
-        return torch.fft.ifft(Zs, dim=1)
-
-    def _best_align(self, y_pred_iq: torch.Tensor, y_true_iq: torch.Tensor,
-                    maxlag: int, gain_align: bool, frac_steps: int):
-        # Returns IQ aligned prediction [B,T,2]
-        if maxlag <= 0 and frac_steps <= 0: return y_pred_iq
-        yp = torch.complex(y_pred_iq[...,0], y_pred_iq[...,1])
-        yt = torch.complex(y_true_iq[...,0], y_true_iq[...,1])
-        B,T = yp.shape
-
-        fracs = [0.0]
-        if frac_steps > 0:
-            for k in range(1, frac_steps+1):
-                f = k / float(frac_steps+1)
-                fracs.extend([+f, -f])
-
-        best = None
-        best_val = None
-
-        for L in range(-maxlag, maxlag+1):
-            for f in fracs:
-                tau = float(L) + f
-                if abs(tau) > 1e-6:
-                    y_shift = self._frac_delay(yp, self.fs, tau)
-                else:
-                    if L > 0:
-                        y_shift = torch.cat([torch.zeros(B, L, device=yp.device, dtype=yp.dtype), yp[:, :-L]], dim=1)
-                    elif L < 0:
-                        y_shift = torch.cat([yp[:, -L:], torch.zeros(B, -L, device=yp.device, dtype=yp.dtype)], dim=1)
-                    else:
-                        y_shift = yp
-                if gain_align:
-                    pwr = (y_shift.conj()*y_shift).real.sum(dim=1).float().clamp_min(1e-12)
-                    num = (yt.conj()*y_shift).sum(dim=1)
-                    g = num / pwr
-                    y_al = y_shift * g.unsqueeze(1)
-                else:
-                    y_al = y_shift
-                score = -((y_al - yt).abs()**2).sum(dim=1)  # [B]
-                if best is None:
-                    best = y_al; best_val = score
-                else:
-                    mask = (score > best_val)
-                    best = torch.where(mask.unsqueeze(1), y_al, best)
-                    best_val = torch.where(mask, score, best_val)
-        return torch.stack([best.real, best.imag], dim=-1)
+    def set_spec_weight(self, w: float):
+        self.spec_w = float(w)
 
     def _peak_emphasis(self, y_true_iq: torch.Tensor, y_pred_iq: torch.Tensor) -> torch.Tensor:
-        # Penalize top-K residual spectral spikes in chosen region (guard/in/both).
-        yt = complex_from_iq(y_true_iq); yp = complex_from_iq(y_pred_iq)
-        B,T = yt.shape
-        Yt = torch.fft.fftshift(torch.fft.fft(yt, dim=1), dim=1)
-        Yp = torch.fft.fftshift(torch.fft.fft(yp, dim=1), dim=1)
-        freqs = torch.fft.fftshift(torch.fft.fftfreq(T, d=1.0/self.fs)).to(yt.device)
+        """
+        Emphasize top-K magnitude residuals in chosen frequency region.
+        """
+        y_true_iq = ensure_iq(y_true_iq)
+        y_pred_iq = ensure_iq(y_pred_iq)
+        yt = complex_from_iq(y_true_iq)
+        yp = complex_from_iq(y_pred_iq)
+        B, T = yt.shape
 
-        BW = self.inband_hz
-        m_in    = (freqs >= -BW/2) & (freqs <= +BW/2)
-        m_guard = ((freqs > +BW/2) & (freqs <= +BW/2+self.guard_hz)) | ((freqs < -BW/2) & (freqs >= -BW/2-self.guard_hz))
-        if self.peak_region == "guard":
-            m = m_guard
-        elif self.peak_region == "in":
-            m = m_in
+        Yt = torch.fft.fft(yt, dim=1)
+        Yp = torch.fft.fft(yp, dim=1)
+        freqs = torch.fft.fftfreq(T, d=1.0 / self.fs).to(yt.device)
+
+        resid = (Yp - Yt).abs()  # [B, T]
+
+        f_in = self.inband / 2.0
+        mask_in = (freqs >= -f_in) & (freqs <= f_in)
+        if self.guard > 0.0:
+            mask_guard = (freqs >= -self.guard) & (freqs <= self.guard)
+            mask_in = mask_in & ~mask_guard
         else:
-            m = m_guard | m_in
+            mask_guard = torch.zeros_like(mask_in, dtype=torch.bool)
 
-        # Residual
-        R = (Yp - Yt).abs()  # [B,T]
-        R = R[:, m]          # [B, M]
-        if R.numel() == 0:
-            return torch.tensor(0.0, device=yt.device)
+        if self.peak_region == "guard":
+            region = mask_guard
+        elif self.peak_region == "in":
+            region = mask_in
+        else:
+            region = mask_guard | mask_in
 
-        k = min(self.peak_k, R.shape[1])
+        if not region.any():
+            return torch.tensor(0.0, device=yt.device, dtype=yt.real.dtype)
+
+        r = resid[:, region]  # [B, Kf]
+        vals = r.reshape(-1)
+        k = min(self.peak_k, vals.numel())
         if k <= 0:
-            return torch.tensor(0.0, device=yt.device)
-        vals, _ = torch.topk(R, k, dim=1)   # [B,k]
-        return vals.mean()
+            return torch.tensor(0.0, device=yt.device, dtype=yt.real.dtype)
+        topk = torch.topk(vals, k=k, dim=-1).values
+        return topk.mean()
 
-    def forward(self, y_true_iq: torch.Tensor, y_pred_iq: torch.Tensor) -> torch.Tensor:
-        # Time loss
-        time_loss = F.l1_loss(y_pred_iq, y_true_iq)
+    def forward(self, y_pred_iq: torch.Tensor, y_true_iq: torch.Tensor) -> torch.Tensor:
+        """
+        Composite loss:
+          - time-domain L1
+          - smoothness in time (first differences)
+          - spectral magnitude loss with region weights, optional peak emphasis
+          - optional alignment-based term
+        """
+        y_pred_iq = ensure_iq(y_pred_iq)
+        y_true_iq = ensure_iq(y_true_iq)
 
-        # Smoothness
-        smooth_loss = first_diff_loss(y_true_iq, y_pred_iq)
+        loss = 0.0
 
-        # Alignment
-        align_loss = torch.tensor(0.0, device=y_true_iq.device)
-        if self.align_w > 0.0 and (self.align_maxlag > 0 or self.align_frac_steps > 0):
-            yp_al = self._best_align(y_pred_iq, y_true_iq, self.align_maxlag, self.gain_align, self.align_frac_steps)
-            align_loss = F.mse_loss(yp_al, y_true_iq)
+        if self.time_w > 0.0:
+            loss_time = (y_pred_iq - y_true_iq).abs().mean()
+            loss = loss + self.time_w * loss_time
 
-        # Spectral loss
-        spec_loss = spectral_loss(y_true_iq, y_pred_iq, self.fs, self.inband_hz, self.guard_hz,
-                                  self.w_in, self.w_guard, self.w_out)
+        if self.smooth_w > 0.0:
+            loss_smooth = first_diff_loss(y_true_iq, y_pred_iq)
+            loss = loss + self.smooth_w * loss_smooth
 
-        peak_loss = torch.tensor(0.0, device=y_true_iq.device)
-        if self.peak_w > 0.0 and self.peak_k > 0:
-            peak_loss = self._peak_emphasis(y_true_iq, y_pred_iq)
+        if self.spec_w > 0.0:
+            loss_spec = spectral_loss(
+                y_true_iq, y_pred_iq,
+                self.fs, self.inband, self.guard,
+                self.w_in, self.w_guard, self.w_out
+            )
+            if self.peak_w > 0.0 and self.peak_k > 0:
+                loss_spec = loss_spec + self.peak_w * self._peak_emphasis(y_true_iq, y_pred_iq)
+            loss = loss + self.spec_w * loss_spec
 
-        total = (self.time_w * time_loss
-                 + self.smooth_w * smooth_loss
-                 + self.align_w * align_loss
-                 + self.spec_w * spec_loss
-                 + self.peak_w * peak_loss)
-        return total
+        if self.align_w > 0.0 and self.align_maxlag > 0:
+            y_pred_al = align_best_frac_gain(
+                y_pred_iq, y_true_iq,
+                fs=self.fs,
+                maxlag=self.align_maxlag,
+                frac_steps=self.align_frac_steps,
+                gain_align=self.gain_align,
+            )
+            loss_align = (y_pred_al - y_true_iq).abs().mean()
+            loss = loss + self.align_w * loss_align
 
-# ---------------- Metrics ----------------
-def snr_in_out_raw(x_iq: torch.Tensor, y_true_iq: torch.Tensor, y_pred_iq: torch.Tensor):
-    # SNR_in: signal vs (x - y_true) (jammer+noise)
-    yt = complex_from_iq(y_true_iq)
-    xt = complex_from_iq(x_iq)
-    yp = complex_from_iq(y_pred_iq)
-    sig_pow = (yt.abs()**2).mean(dim=1).clamp_min(1e-12)
-    in_res = xt - yt
-    in_pow = (in_res.abs()**2).mean(dim=1).clamp_min(1e-12)
-    out_res = yp - yt
-    out_pow = (out_res.abs()**2).mean(dim=1).clamp_min(1e-12)
-    snr_in = 10.0*torch.log10(sig_pow/in_pow).mean().item()
-    snr_out = 10.0*torch.log10(sig_pow/out_pow).mean().item()
-    return snr_in, snr_out
+        return loss
 
-def evm_rms_pct_raw(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
-    yt = complex_from_iq(y_true); yp = complex_from_iq(y_pred)
-    err = yt - yp
-    evm = (err.abs()**2).mean().sqrt()
-    ref = (yt.abs()**2).mean().sqrt().clamp_min(1e-12)
-    return 100.0*(evm/ref).item()
-
-def evm_aligned_inband_pct(y_true: torch.Tensor, y_pred: torch.Tensor, fs: float, inband: float, guard: float,
-                           maxlag=12, frac_steps=5, gain_align=True) -> float:
-    y_pred_al = align_best_frac_gain(y_pred, y_true, fs, maxlag, frac_steps, gain_align)
-    yt_in  = bandlimit_inband(y_true, fs, inband, guard)
-    yp_in  = bandlimit_inband(y_pred_al, fs, inband, guard)
-    yt = complex_from_iq(yt_in); yp = complex_from_iq(yp_in)
-    err_pow = ((yp - yt).abs()**2).mean(dim=1).clamp_min(1e-12)
-    ref_pow = (yt.abs()**2).mean(dim=1).clamp_min(1e-12)
-    return 100.0*torch.sqrt(err_pow/ref_pow).mean().item()
 
 # ---------------- EMA ----------------
+
 class EMA:
     def __init__(self, model: nn.Module, decay: float = 0.999):
-        self.decay=float(decay)
-        self.shadow={}
-        for n,p in (model.module if hasattr(model,"module") else model).named_parameters():
+        self.decay = float(decay)
+        self.shadow = {}
+        for n, p in (model.module if hasattr(model, "module") else model).named_parameters():
             if p.requires_grad:
-                self.shadow[n]=p.data.detach().clone()
-        self.backup={}
+                self.shadow[n] = p.data.detach().clone()
+        self.backup = {}
+
     @torch.no_grad()
-    def update(self, model):
-        m = model.module if hasattr(model,"module") else model
-        for n,p in m.named_parameters():
-            if p.requires_grad:
-                if n not in self.shadow:
-                    self.shadow[n]=p.data.detach().clone()
-                else:
-                    new = (1.0-self.decay)*p.data + self.decay*self.shadow[n]
-                    self.shadow[n] = new.detach().clone()
-    @torch.no_grad()
-    def apply(self, model):
-        self.backup={}
-        m = model.module if hasattr(model,"module") else model
-        for n,p in m.named_parameters():
+    def update(self, model: nn.Module):
+        m = model.module if hasattr(model, "module") else model
+        for n, p in m.named_parameters():
             if p.requires_grad and n in self.shadow:
-                self.backup[n]=p.data.detach().clone()
-                p.data.copy_(self.shadow[n].to(p.device))
+                self.shadow[n].mul_(self.decay).add_(p.data.detach(), alpha=1.0 - self.decay)
+
     @torch.no_grad()
-    def restore(self, model):
-        if not self.backup: return
-        m = model.module if hasattr(model,"module") else model
-        for n,p in m.named_parameters():
+    def apply(self, model: nn.Module):
+        self.backup = {}
+        m = model.module if hasattr(model, "module") else model
+        for n, p in m.named_parameters():
+            if p.requires_grad and n in self.shadow:
+                self.backup[n] = p.data.detach().clone()
+                p.data.copy_(self.shadow[n].to(p.device))
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module):
+        if not self.backup:
+            return
+        m = model.module if hasattr(model, "module") else model
+        for n, p in m.named_parameters():
             if p.requires_grad and n in self.backup:
                 p.data.copy_(self.backup[n])
-        self.backup={}
-    def state_dict_for(self, model):
-        return {k:v.cpu() for k,v in self.shadow.items()}
+        self.backup = {}
+
+    def state_dict_for(self, model: nn.Module):
+        return {k: v.cpu() for k, v in self.shadow.items()}
+
 
 # ---------------- DDP utils ----------------
+
 def ddp_init():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        world = int(os.environ["WORLD_SIZE"]); rank  = int(os.environ["RANK"])
-        local = int(os.environ.get("LOCAL_RANK","0"))
+        world = int(os.environ["WORLD_SIZE"])
+        rank = int(os.environ["RANK"])
+        local = int(os.environ.get("LOCAL_RANK", "0"))
         dist.init_process_group(backend="nccl", init_method="env://")
         torch.cuda.set_device(local)
         return world, rank, local
     return 1, 0, 0
 
-def is_master(rank:int)->bool: return (rank==0)
+
+def is_master(rank: int) -> bool:
+    return rank == 0
+
 
 # ---------------- Scheduler helpers ----------------
+
 def linear_warmup(step: int, warm_steps: int) -> float:
-    return min(1.0, (step+1)/max(1, warm_steps))
+    return min(1.0, (step + 1) / max(1, warm_steps))
 
-def make_cosine_sched(optimizer, T_max:int, eta_min:float=0.0):
-    return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=eta_min)
 
-def make_cawr_sched(optimizer, T_0:int, T_mult:int, eta_min:float=0.0):
-    return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min)
-
-# ---------------- Alignment helper ----------------
-def align_best_frac_gain(y_pred_iq: torch.Tensor, y_true_iq: torch.Tensor,
-                         fs: float, maxlag: int, frac_steps: int, gain_align: bool):
-    loss_align = CompositeLoss(fs, fs, 0.0, align_maxlag=maxlag, align_w=0.0,
-                               gain_align=gain_align, align_frac_steps=frac_steps)
-    return loss_align._best_align(y_pred_iq, y_true_iq, maxlag, gain_align, frac_steps)
-
-# ---------------- Data loaders ----------------
-def make_loader(X: np.ndarray, Y: np.ndarray, batch: int, shuffle: bool,
-                rank:int, world:int, num_workers:int=4):
-    ds = IQWindows(X,Y)
-    if world>1:
-        sampler = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=shuffle, drop_last=False)
-        return DataLoader(ds, batch_size=batch, sampler=sampler, num_workers=num_workers, pin_memory=True)
+def configure_scheduler(opt, args, steps_per_epoch: int, total_steps: int):
+    if args.scheduler == "cosine":
+        warm_steps = int(args.warmup_frac * total_steps)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=max(1, total_steps - warm_steps)
+        )
+        return {"type": "cosine", "obj": sched, "warm_steps": warm_steps}
+    elif args.scheduler == "cawr":
+        sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            opt, T_0=max(1, args.cawr_T0), T_mult=max(1, args.cawr_Tmult)
+        )
+        warm_steps = int(args.warmup_frac * steps_per_epoch * args.cawr_T0) if args.warmup_frac > 0 else 0
+        return {"type": "cawr", "obj": sched, "warm_steps": warm_steps}
     else:
-        return DataLoader(ds, batch_size=batch, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
+        return {"type": "none", "obj": None, "warm_steps": 0}
+
+
+# ---------------- Data loaders & model factory ----------------
+
+def make_model(in_ch: int, hid: int, blocks: int, k: int, dropout: float) -> nn.Module:
+    return ResidualTCN(in_ch=in_ch, hid=hid, blocks=blocks, k=k, dropout=dropout)
+
+
+def make_loader(X: np.ndarray, Y: np.ndarray, batch: int, shuffle: bool,
+                rank: int, world: int, num_workers: int = 4):
+    ds = IQWindows(X, Y)
+    if world > 1:
+        sampler = DistributedSampler(ds, num_replicas=world, rank=rank,
+                                     shuffle=shuffle, drop_last=False)
+        return DataLoader(ds, batch_size=batch, sampler=sampler,
+                          num_workers=num_workers, pin_memory=True)
+    else:
+        return DataLoader(ds, batch_size=batch, shuffle=shuffle,
+                          num_workers=num_workers, pin_memory=True)
+
 
 def make_loader_from_ds(ds: Dataset, batch: int, shuffle: bool,
                         rank: int, world: int, num_workers: int = 4):
-    if world>1:
-        sampler = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=shuffle, drop_last=False)
-        return DataLoader(ds, batch_size=batch, sampler=sampler, num_workers=num_workers, pin_memory=True)
+    if world > 1:
+        sampler = DistributedSampler(ds, num_replicas=world, rank=rank,
+                                     shuffle=shuffle, drop_last=False)
+        return DataLoader(ds, batch_size=batch, sampler=sampler,
+                          num_workers=num_workers, pin_memory=True)
     else:
-        return DataLoader(ds, batch_size=batch, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
+        return DataLoader(ds, batch_size=batch, shuffle=shuffle,
+                          num_workers=num_workers, pin_memory=True)
+
 
 # ---------------- Train ----------------
+
 def train(args):
     world, rank, local = ddp_init()
     device = torch.device(f"cuda:{local}" if torch.cuda.is_available() else "cpu")
@@ -562,7 +774,8 @@ def train(args):
     torch.backends.cudnn.benchmark = True
 
     data = load_npz(args.data)
-    Xtr,Ytr = data["train"]; Xva,Yva = data["val"]
+    Xtr, Ytr = data["train"]
+    Xva, Yva = data["val"]
 
     # ---- build train loader (optionally with curriculum) ----
     if getattr(args, "curriculum", False):
@@ -572,43 +785,49 @@ def train(args):
         train_ds = IQWindows(Xtr, Ytr)
 
     train_loader = make_loader_from_ds(train_ds, args.batch, True, rank, world, args.workers)
-    val_loader   = make_loader(Xva, Yva, max(1,args.batch//2), False, rank, world, args.workers)
+    val_loader = make_loader(Xva, Yva, max(1, args.batch // 2), False, rank, world, args.workers)
 
-    model = make_model(in_ch=4, hid=args.width, blocks=args.blocks, k=args.kernel, dropout=args.dropout).to(device)
-    if world>1:
+    model = make_model(in_ch=4, hid=args.width, blocks=args.blocks,
+                       k=args.kernel, dropout=args.dropout).to(device)
+    if world > 1:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        model = nn.parallel.DistributedDataParallel(model, device_ids=[local], find_unused_parameters=False)
+        model = nn.parallel.DistributedDataParallel(
+            model, device_ids=[local], find_unused_parameters=False
+        )
 
-    loss_fn = CompositeLoss(args.fs, args.inband, args.guard,
-                            spec_w=args.spec_w, w_in=args.spec_w_in, w_guard=args.spec_w_guard, w_out=args.spec_w_out,
-                            smooth_w=args.smooth_w, time_w=args.time_w,
-                            align_maxlag=args.align_maxlag, align_w=args.align_w, gain_align=args.gain_align,
-                            align_frac_steps=args.align_frac_steps,
-                            peak_w=args.peak_w, peak_k=args.peak_k, peak_region=args.peak_region)
+    loss_fn = CompositeLoss(
+        args.fs, args.inband, args.guard,
+        spec_w=args.spec_w,
+        w_in=args.spec_w_in,
+        w_guard=args.spec_w_guard,
+        w_out=args.spec_w_out,
+        smooth_w=args.smooth_w,
+        time_w=args.time_w,
+        align_maxlag=args.align_maxlag,
+        align_w=args.align_w,
+        gain_align=args.gain_align,
+        align_frac_steps=args.align_frac_steps,
+        peak_w=args.peak_w,
+        peak_k=args.peak_k,
+        peak_region=args.peak_region,
+    )
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    opt = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.wd, betas=(0.9, 0.999)
+    )
 
-    # Scheduler setup
     steps_per_epoch = max(1, len(train_loader))
     total_steps = args.epochs * steps_per_epoch
-    warm_steps = int(args.warmup_frac * total_steps)
-    if args.scheduler == "cosine":
-        sched = make_cosine_sched(opt, T_max=max(1,total_steps-warm_steps), eta_min=0.0)
-        sched_info = {"type":"cosine", "obj":sched, "warm_steps":warm_steps}
-    elif args.scheduler == "cawr":
-        sched = make_cawr_sched(opt, T_0=max(1,args.cawr_T0*steps_per_epoch), T_mult=args.cawr_Tmult, eta_min=0.0)
-        sched_info = {"type":"cawr", "obj":sched, "warm_steps":warm_steps}
-    else:
-        sched_info = {"type":"none", "obj":None, "warm_steps":warm_steps}
+    sched_info = configure_scheduler(opt, args, steps_per_epoch, total_steps)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
-    ema = EMA(model, decay=args.ema) if args.ema>0 else None
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+    ema = EMA(model, decay=args.ema) if args.ema > 0 else None
 
     best_val = float("inf")
     Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
 
     step = 0
-    for epoch in range(1, args.epochs+1):
+    for epoch in range(1, args.epochs + 1):
         # ---- curriculum schedule: grow from min_frac → 1.0 over curriculum_epochs ----
         if getattr(args, "curriculum", False) and hasattr(train_loader.dataset, "set_curriculum_progress"):
             if args.curriculum_epochs > 1:
@@ -621,10 +840,10 @@ def train(args):
                 active_n = train_loader.dataset._active_n()
                 print(f"[curriculum] epoch {epoch}: using easiest {active_n}/{Xtr.shape[0]} samples (frac={frac:.3f})")
 
-        if world>1 and isinstance(train_loader.sampler, DistributedSampler):
+        if world > 1 and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
 
-        # ---- spec loss ramp (fixed: keep final after ramp) ----
+        # ---- spec loss ramp (keep final after ramp) ----
         if args.spec_w_ramp_epochs > 0:
             if epoch <= args.spec_w_ramp_epochs:
                 t_prog = epoch / float(max(1, args.spec_w_ramp_epochs))
@@ -644,59 +863,80 @@ def train(args):
                 loss_fn.peak_w = args.peak_w
 
         model.train()
-        t0=time.time()
+        t0 = time.time()
+        train_loss_sum = 0.0
+        n_train_batches = 0
+
         for i, (xb, yb) in enumerate(train_loader):
-            xb = xb.to(device, non_blocking=True)   # [B,T,2]
+            xb = xb.to(device, non_blocking=True)  # [B, T, 2]
             yb = yb.to(device, non_blocking=True)
             if args.perseq_norm:
                 xb, yb = perseq_rms_norm(xb, yb)
 
-            base = notch_tonal_multi(xb, args.fs, peaks=args.notch_peaks,
-                                     q=args.notch_q, depth_db=args.notch_depth)
+            base = notch_tonal_multi(
+                xb, args.fs,
+                peaks=args.notch_peaks,
+                q=args.notch_q,
+                depth_db=args.notch_depth,
+            )  # [B, T, 2]
 
-            jam = xb.permute(0,2,1)                 # [B,2,T]
-            bas = base.permute(0,2,1)               # [B,2,T]
-            inp = torch.cat([jam, bas], dim=1)      # [B,4,T]
+            jam = xb.permute(0, 2, 1)   # [B, 2, T]
+            bas = base.permute(0, 2, 1) # [B, 2, T]
+            inp = torch.cat([jam, bas], dim=1)  # [B, 4, T]
 
-            with torch.cuda.amp.autocast(enabled=args.amp):
-                yhat = model(inp).permute(0,2,1)    # [B,T,2]
-                loss = loss_fn(yb, yhat)
+            with torch.amp.autocast('cuda', enabled=args.amp):
+                resid = model(inp)                    # [B, 2, T]
+                resid = resid.permute(0, 2, 1)       # [B, T, 2]
+                yhat = base + resid                  # [B, T, 2]
+                loss = loss_fn(yhat, yb)
 
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
-            if args.grad_clip>0:
+            if args.grad_clip > 0:
                 scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(opt); scaler.update()
+                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(opt)
+            scaler.update()
 
-            # ---- Scheduler step ----
-            if sched_info["type"] == "cosine":
-                if step < sched_info["warm_steps"]:
+            # LR scheduler step
+            if sched_info["type"] != "none":
+                if sched_info["warm_steps"] > 0 and step < sched_info["warm_steps"]:
+                    scale = linear_warmup(step, sched_info["warm_steps"])
                     for pg in opt.param_groups:
-                        pg["lr"] = args.lr * linear_warmup(step, sched_info["warm_steps"])
+                        pg["lr"] = args.lr * scale
                 else:
-                    sched_info["obj"].step()
-            elif sched_info["type"] == "cawr":
-                if step < sched_info["warm_steps"]:
-                    for pg in opt.param_groups:
-                        pg["lr"] = args.lr * linear_warmup(step, sched_info["warm_steps"])
-                sched_info["obj"].step(epoch-1 + i/float(max(1,steps_per_epoch)))
+                    if sched_info["type"] == "cosine":
+                        sched_info["obj"].step()
+                    elif sched_info["type"] == "cawr":
+                        sched_info["obj"].step(epoch - 1 + i / max(1, steps_per_epoch))
+
             step += 1
+            train_loss_sum += loss.item()
+            n_train_batches += 1
 
-            if ema: ema.update(model)
+            if ema is not None:
+                ema.update(model)
 
-        # ---- validation ----
+        if master:
+            dt = time.time() - t0
+            train_loss = train_loss_sum / max(1, n_train_batches)
+            print(f"Epoch {epoch:03d} | train loss {train_loss:.6f} | {dt:.1f}s")
+
+        # ---------------- Validation ----------------
+        if ema is not None:
+            ema.apply(model)
         model.eval()
-        if ema: ema.apply(model)
 
         val_loss = 0.0
         snr_in_sum = 0.0
         snr_out_sum = 0.0
         evm_sum = 0.0
         n_batches = 0
+
         evm_ai_sum_local = 0.0
         evm_ai_batches_local = 0.0
 
+        t0 = time.time()
         with torch.no_grad():
             for xb, yb in val_loader:
                 xb = xb.to(device, non_blocking=True)
@@ -704,83 +944,112 @@ def train(args):
                 if args.perseq_norm:
                     xb, yb = perseq_rms_norm(xb, yb)
 
-                base = notch_tonal_multi(xb, args.fs, peaks=args.notch_peaks,
-                                         q=args.notch_q, depth_db=args.notch_depth)
-                jam = xb.permute(0,2,1)
-                bas = base.permute(0,2,1)
+                base = notch_tonal_multi(
+                    xb, args.fs,
+                    peaks=args.notch_peaks,
+                    q=args.notch_q,
+                    depth_db=args.notch_depth,
+                )
+                jam = xb.permute(0, 2, 1)
+                bas = base.permute(0, 2, 1)
                 inp = torch.cat([jam, bas], dim=1)
-
-                with torch.cuda.amp.autocast(enabled=args.amp):
-                    yhat = model(inp).permute(0,2,1)
+                resid = model(inp).permute(0, 2, 1)
+                yhat = base + resid
 
                 val_loss += loss_fn(yhat, yb).item()
-                si, so = snr_in_out_raw(xb, yb, yhat); snr_in_sum += si; snr_out_sum += so
+                si, so = snr_in_out_raw(xb, yb, yhat)
+                snr_in_sum += si
+                snr_out_sum += so
                 evm_sum += evm_rms_pct_raw(yb, yhat)
                 n_batches += 1
 
-                # optional aligned,in-band diagnostic EVM
                 if args.diag_ai_evm != "off":
-                    evm_ai = evm_aligned_inband_pct(yb, yhat, args.fs, args.inband, args.guard,
-                                                    maxlag=max(8, args.align_maxlag),
-                                                    frac_steps=max(3, args.align_frac_steps),
-                                                    gain_align=True)
+                    evm_ai = evm_aligned_inband_pct(
+                        yb, yhat,
+                        args.fs, args.inband, args.guard,
+                        maxlag=max(8, args.align_maxlag),
+                        frac_steps=max(3, args.align_frac_steps),
+                        gain_align=True,
+                    )
                     evm_ai_sum_local += float(evm_ai)
                     evm_ai_batches_local += 1.0
                     if args.diag_ai_evm == "batch" and master:
                         print(f"      ↳ (aligned,in-band) EVM {evm_ai:.2f}%")
 
-        if ema: ema.restore(model)
+        if ema is not None:
+            ema.restore(model)
 
         # reduce across ranks (main metrics)
-        if world>1:
-            t = torch.tensor([val_loss, snr_in_sum, snr_out_sum, evm_sum, n_batches], device=device)
+        if world > 1:
+            t = torch.tensor(
+                [val_loss, snr_in_sum, snr_out_sum, evm_sum, n_batches],
+                device=device,
+            )
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
             val_loss, snr_in_sum, snr_out_sum, evm_sum, n_batches = t.tolist()
 
-        val_loss /= max(1,n_batches)
-        snr_in  = snr_in_sum/max(1,n_batches)
-        snr_out = snr_out_sum/max(1,n_batches)
-        evm     = evm_sum/max(1,n_batches)
+        val_loss /= max(1, n_batches)
+        snr_in = snr_in_sum / max(1, n_batches)
+        snr_out = snr_out_sum / max(1, n_batches)
+        evm = evm_sum / max(1, n_batches)
 
         if master:
-            dt=time.time()-t0
-            msg = (f"Epoch {epoch:03d} | val {val_loss:.6f} | "
-                   f"SNR_in {snr_in:.2f} dB → SNR_out {snr_out:.2f} dB | "
-                   f"EVM {evm:.2f}% | {dt:.1f}s")
-            print(msg)
+            dt = time.time() - t0
+            print(
+                f"Epoch {epoch:03d} | val {val_loss:.6f} | "
+                f"SNR_in {snr_in:+.2f} dB → SNR_out {snr_out:+.2f} dB | "
+                f"EVM {evm:.2f}% | {dt:.1f}s"
+            )
 
-        # optional aligned,in-band EVM aggregated over validation
+        # epoch-avg aligned,in-band EVM
         if args.diag_ai_evm != "off":
-            if world>1:
-                t2 = torch.tensor([evm_ai_sum_local, evm_ai_batches_local], device=device)
-                dist.all_reduce(t2, op=dist.ReduceOp.SUM)
-                evm_ai_sum, evm_ai_batches = t2.tolist()
+            if world > 1:
+                t_ai = torch.tensor(
+                    [evm_ai_sum_local, evm_ai_batches_local], device=device
+                )
+                dist.all_reduce(t_ai, op=dist.ReduceOp.SUM)
+                evm_ai_sum_tot, evm_ai_batches_tot = t_ai.tolist()
             else:
-                evm_ai_sum, evm_ai_batches = evm_ai_sum_local, evm_ai_batches_local
-            if evm_ai_batches > 0 and master:
-                evm_ai_mean = evm_ai_sum / max(1.0, evm_ai_batches)
-                print(f"      ↳ (aligned,in-band) EVM (epoch avg) {evm_ai_mean:.2f}%")
+                evm_ai_sum_tot, evm_ai_batches_tot = evm_ai_sum_local, evm_ai_batches_local
+            if args.diag_ai_evm == "epoch" and master and evm_ai_batches_tot > 0:
+                evm_ai_avg = evm_ai_sum_tot / evm_ai_batches_tot
+                print(f"      ↳ (aligned,in-band) EVM (epoch avg) {evm_ai_avg:.2f}%")
 
-        # ---- save best ----
+        # save best
         if master and (val_loss < best_val):
             best_val = val_loss
             ck = {
-                "model": (ema.state_dict_for(model) if (ema is not None) else
-                          (model.module.state_dict() if hasattr(model,'module') else model.state_dict())),
+                "model": (
+                    ema.state_dict_for(model)
+                    if (ema is not None)
+                    else (
+                        model.module.state_dict()
+                        if hasattr(model, "module")
+                        else model.state_dict()
+                    )
+                ),
                 "args": vars(args),
                 "val": val_loss,
                 "epoch": epoch,
             }
             Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
-            torch.save(ck, Path(args.ckpt_dir)/"best.pt")
-            print("  ↳ saved best ->", Path(args.ckpt_dir)/"best.pt")
+            out_path = Path(args.ckpt_dir) / "best.pt"
+            torch.save(ck, out_path)
+            print("  ↳ saved best ->", out_path)
+
+    if world > 1:
+        dist.destroy_process_group()
+
 
 # ---------------- CLI ----------------
+
 def build_argparser():
-    ap = argparse.ArgumentParser("Notch+TCN trainer — cosine scheduler variants")
+    ap = argparse.ArgumentParser("Notch+Residual-TCN jammer-denoiser trainer")
+
     # data / io
     ap.add_argument("--data", type=str, required=True)
     ap.add_argument("--ckpt-dir", type=str, default="ckpts_notch")
+
     # curriculum learning
     ap.add_argument("--curriculum", action="store_true",
                     help="Enable easy→hard curriculum based on SNR_in estimated from X/Y.")
@@ -788,19 +1057,23 @@ def build_argparser():
                     help="Epochs to grow from easiest subset to full train set.")
     ap.add_argument("--curriculum-min-frac", type=float, default=0.3,
                     help="Starting fraction of easiest samples (0<frac<=1).")
+
     # signal params
     ap.add_argument("--fs", type=float, default=4.092e6)
     ap.add_argument("--inband", type=float, default=2.046e6)
     ap.add_argument("--guard", type=float, default=150e3)
+
     # notch
     ap.add_argument("--notch-peaks", type=int, default=2)
     ap.add_argument("--notch-q", type=float, default=800.0)
     ap.add_argument("--notch-depth", type=float, default=90.0)
+
     # model
     ap.add_argument("--width", type=int, default=64)
     ap.add_argument("--blocks", type=int, default=8)
     ap.add_argument("--kernel", type=int, default=7)
     ap.add_argument("--dropout", type=float, default=0.05)
+
     # loss weights
     ap.add_argument("--time-w", type=float, default=1.0)
     ap.add_argument("--spec-w", type=float, default=0.3)
@@ -808,16 +1081,35 @@ def build_argparser():
     ap.add_argument("--spec-w-guard", type=float, default=1.0)
     ap.add_argument("--spec-w-out", type=float, default=1.0)
     ap.add_argument("--smooth-w", type=float, default=0.05)
-    # alignment
-    ap.add_argument("--align-maxlag", type=int, default=0, help="max integer lag for align term (0 disables)")
-    ap.add_argument("--align-w", type=float, default=0.0, help="weight of alignment term")
-    ap.add_argument("--gain-align", action="store_true", help="include gain alignment in alignment term")
-    ap.add_argument("--align-frac-steps", type=int, default=0, help="fractional delay steps (0 disables)")
-    # peak emphasis
-    ap.add_argument("--peak-w", type=float, default=0.0, help="weight for peak emphasis term (0 disables)")
-    ap.add_argument("--peak-k", type=int, default=0, help="K bins per batch to emphasize (0 disables)")
-    ap.add_argument("--peak-region", type=str, default="guard", choices=["guard","in","both"])
-    ap.add_argument("--peak-ramp-epochs", type=int, default=0, help="epochs to ramp peak_w from 0→peak_w (0 disables)")
+
+    # normalization + alignment
+    ap.add_argument("--perseq-norm", action="store_true",
+                    help="Per-window RMS normalization using clean RMS.")
+    ap.add_argument("--align-maxlag", type=int, default=0,
+                    help="Max integer lag for align term (0 disables).")
+    ap.add_argument("--align-w", type=float, default=0.0,
+                    help="Weight of optional alignment term.")
+    ap.add_argument("--gain-align", action="store_true",
+                    help="Include complex gain alignment in align term.")
+    ap.add_argument("--align-frac-steps", type=int, default=0,
+                    help="Fractional delay steps (currently ignored).")
+
+    # spectral weight ramp
+    ap.add_argument("--spec-w-final", type=float, default=0.6,
+                    help="Target spectral weight after ramp.")
+    ap.add_argument("--spec-w-ramp-epochs", type=int, default=10,
+                    help="Epochs to ramp spec_w to spec-w-final (0 disables).")
+
+    # top-K spectral peak emphasis
+    ap.add_argument("--peak-w", type=float, default=0.0,
+                    help="Extra weight for top-K spectral residuals.")
+    ap.add_argument("--peak-k", type=int, default=0,
+                    help="K bins per batch to emphasize (0 disables).")
+    ap.add_argument("--peak-region", type=str, default="guard",
+                    choices=["guard", "in", "both"])
+    ap.add_argument("--peak-ramp-epochs", type=int, default=0,
+                    help="Epochs to ramp peak_w from 0→peak_w (0 disables).")
+
     # opt + scheduler
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--batch", type=int, default=128)
@@ -827,18 +1119,27 @@ def build_argparser():
     ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--scheduler", type=str, default="cawr", choices=["cosine","cawr","none"])
-    ap.add_argument("--cawr-T0", type=int, default=5, help="epochs between first restart")
-    ap.add_argument("--cawr-Tmult", type=int, default=2, help="restart period multiplier")
-    ap.add_argument("--warmup-frac", type=float, default=0.06, help="fraction of steps for LR warmup")
+    ap.add_argument("--scheduler", type=str, default="cawr",
+                    choices=["cosine", "cawr", "none"])
+    ap.add_argument("--cawr-T0", type=int, default=5,
+                    help="Epochs between first restart for CAWR.")
+    ap.add_argument("--cawr-Tmult", type=int, default=2,
+                    help="Restart period multiplier for CAWR.")
+    ap.add_argument("--warmup-frac", type=float, default=0.06,
+                    help="Fraction of steps for LR warmup.")
+
     # diagnostics
-    ap.add_argument("--diag-ai-evm", type=str, default="off", choices=["off","epoch","batch"],
-                    help="Aligned,in-band EVM logging: off (default), once per epoch, or per-batch.")
+    ap.add_argument("--diag-ai-evm", type=str, default="off",
+                    choices=["off", "epoch", "batch"],
+                    help="Aligned,in-band EVM logging: off, once per epoch, or per-batch.")
+
     return ap
+
 
 def main():
     args = build_argparser().parse_args()
     train(args)
+
 
 if __name__ == "__main__":
     main()

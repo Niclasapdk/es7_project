@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=gnss_tcn_8g
+#SBATCH --job-name=gnss_tcn
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:6
-#SBATCH --cpus-per-task=96
-#SBATCH --mem=150G
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=70
+#SBATCH --mem=250G
 #SBATCH --time=12:00:00
 #SBATCH --output=logs.out
 #SBATCH --error=logs.err
@@ -16,7 +16,7 @@ export OMP_NUM_THREADS=1
 
 # 128 CPUs ≈ 16 workers/GPU → --workers 16 (per process). If that overloads the FS, drop to 12.
 singularity exec --nv /ceph/container/pytorch/pytorch_25.09.sif \
-  torchrun --standalone --nproc_per_node=6 chat_tcn_train.py \
+  torchrun --standalone --nproc_per_node=4 chat_tcn_train.py \
   --data gnss_sweptcw_500k.npz \
   --ckpt-dir ckpts_curriculum \
   --epochs 160 \
