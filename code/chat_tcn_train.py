@@ -237,23 +237,47 @@ class ResidualTCN(nn.Module):
 # ---------------- SNR / EVM metrics ----------------
 
 @torch.no_grad()
-def snr_in_out_raw(x_iq: torch.Tensor,
-                   y_true_iq: torch.Tensor,
-                   y_pred_iq: torch.Tensor,
-                   eps: float = 1e-12):
+def snr_in_out_evm_per_sample(x_iq: torch.Tensor,
+                              y_true_iq: torch.Tensor,
+                              y_pred_iq: torch.Tensor,
+                              eps: float = 1e-12):
     """
-    Compute SNR_in and SNR_out in dB, using mean(|y|^2) / mean(|err|^2).
+    Per-sequence SNR_in, SNR_out and EVM metrics.
+
+    Returns three tensors of shape [B]:
+      - snr_in_db
+      - snr_out_db
+      - evm_rms_pct
     """
     x = complex_from_iq(x_iq)
     y = complex_from_iq(y_true_iq)
     yhat = complex_from_iq(y_pred_iq)
 
-    sig_pow = (y.abs() ** 2).mean(dim=1).clamp_min(eps)
-    in_err_pow = (x - y).abs().pow(2).mean(dim=1).clamp_min(eps)
+    sig_pow = (y.abs() ** 2).mean(dim=1).clamp_min(eps)          # [B]
+    in_err_pow = (x - y).abs().pow(2).mean(dim=1).clamp_min(eps) # [B]
     out_err_pow = (yhat - y).abs().pow(2).mean(dim=1).clamp_min(eps)
 
-    snr_in = 10.0 * torch.log10(sig_pow / in_err_pow).mean().item()
-    snr_out = 10.0 * torch.log10(sig_pow / out_err_pow).mean().item()
+    snr_in = 10.0 * torch.log10(sig_pow / in_err_pow)    # [B]
+    snr_out = 10.0 * torch.log10(sig_pow / out_err_pow)  # [B]
+
+    err_pow = (yhat - y).abs().pow(2).mean(dim=1).clamp_min(eps)
+    ref_pow = sig_pow
+    evm = torch.sqrt(err_pow / ref_pow) * 100.0          # [B], percent
+
+    return snr_in, snr_out, evm
+
+
+@torch.no_grad()
+def snr_in_out_raw(x_iq: torch.Tensor,
+                   y_true_iq: torch.Tensor,
+                   y_pred_iq: torch.Tensor,
+                   eps: float = 1e-12):
+    """
+    Backwards-compatible mean SNR_in and SNR_out in dB.
+    """
+    snr_in_vec, snr_out_vec, _ = snr_in_out_evm_per_sample(x_iq, y_true_iq, y_pred_iq, eps=eps)
+    snr_in = snr_in_vec.mean().item()
+    snr_out = snr_out_vec.mean().item()
     return snr_in, snr_out
 
 
@@ -263,14 +287,12 @@ def evm_rms_pct_raw(y_true_iq: torch.Tensor,
                     eps: float = 1e-12) -> float:
     """
     Root-mean-square EVM (%) ignoring bandlimits / alignment.
+    Backwards-compatible wrapper around per-sample metric.
     """
-    yt = complex_from_iq(y_true_iq)
-    yp = complex_from_iq(y_pred_iq)
-
-    err_pow = (yp - yt).abs().pow(2).mean(dim=1).clamp_min(eps)
-    ref_pow = yt.abs().pow(2).mean(dim=1).clamp_min(eps)
-    evm = torch.sqrt(err_pow / ref_pow).mean()
-    return 100.0 * evm.item()
+    _, _, evm_vec = snr_in_out_evm_per_sample(y_pred_iq, y_true_iq, y_pred_iq, eps=eps)
+    # NOTE: we don't actually use this in the training loop anymore,
+    # but keep it for compatibility.
+    return evm_vec.mean().item()
 
 
 # ---------------- Composite denoising loss ----------------
@@ -513,7 +535,7 @@ def train(args):
             scaler.update()
 
             # LR scheduler step
-            if sched_info["type"] != "none":
+            if sched_info["type"] != ["none"]:
                 if sched_info["warm_steps"] > 0 and step < sched_info["warm_steps"]:
                     scale = linear_warmup(step, sched_info["warm_steps"])
                     for pg in opt.param_groups:
@@ -544,8 +566,14 @@ def train(args):
         val_loss = 0.0
         snr_in_sum = 0.0
         snr_out_sum = 0.0
+        snr_gain_sum = 0.0
         evm_sum = 0.0
         n_batches = 0
+
+        # hardest sample on this rank (lowest input SNR)
+        hardest_in = float("inf")
+        hardest_out = 0.0
+        hardest_evm = 0.0
 
         t0 = time.time()
         with torch.no_grad():
@@ -559,12 +587,25 @@ def train(args):
                 j_hat = model(jam).permute(0, 2, 1)
                 y_hat = xb - j_hat
 
+                # loss
                 val_loss += loss_fn(y_hat, yb).item()
-                si, so = snr_in_out_raw(xb, yb, y_hat)
-                snr_in_sum += si
-                snr_out_sum += so
-                evm_sum += evm_rms_pct_raw(yb, y_hat)
+
+                # per-sample metrics
+                snr_in_b, snr_out_b, evm_b = snr_in_out_evm_per_sample(xb, yb, y_hat)
+                snr_gain_b = snr_out_b - snr_in_b
+
+                snr_in_sum += snr_in_b.mean().item()
+                snr_out_sum += snr_out_b.mean().item()
+                snr_gain_sum += snr_gain_b.mean().item()
+                evm_sum += evm_b.mean().item()
                 n_batches += 1
+
+                # track hardest sample on this rank: minimal SNR_in
+                batch_hardest_in, idx_min = snr_in_b.min(dim=0)
+                if batch_hardest_in.item() < hardest_in:
+                    hardest_in = batch_hardest_in.item()
+                    hardest_out = snr_out_b[idx_min].item()
+                    hardest_evm = evm_b[idx_min].item()
 
         if ema is not None:
             ema.restore(model)
@@ -572,24 +613,47 @@ def train(args):
         # reduce across ranks (main metrics)
         if world > 1:
             t = torch.tensor(
-                [val_loss, snr_in_sum, snr_out_sum, evm_sum, n_batches],
+                [val_loss, snr_in_sum, snr_out_sum, snr_gain_sum, evm_sum, n_batches],
                 device=device,
             )
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            val_loss, snr_in_sum, snr_out_sum, evm_sum, n_batches = t.tolist()
+            val_loss, snr_in_sum, snr_out_sum, snr_gain_sum, evm_sum, n_batches = t.tolist()
 
         val_loss /= max(1, n_batches)
         snr_in = snr_in_sum / max(1, n_batches)
         snr_out = snr_out_sum / max(1, n_batches)
+        snr_gain = snr_gain_sum / max(1, n_batches)
         evm = evm_sum / max(1, n_batches)
+
+        # gather hardest sample (lowest SNR_in) across ranks
+        if world > 1:
+            triple = torch.tensor([hardest_in, hardest_out, hardest_evm], device=device)
+            gathered = [torch.empty_like(triple) for _ in range(world)]
+            dist.all_gather(gathered, triple)
+            if master:
+                triples = torch.stack(gathered)  # [world, 3]
+                best_idx = torch.argmin(triples[:, 0])  # 0 = SNR_in
+                hardest_in_global = triples[best_idx, 0].item()
+                hardest_out_global = triples[best_idx, 1].item()
+                hardest_evm_global = triples[best_idx, 2].item()
+        else:
+            hardest_in_global = hardest_in
+            hardest_out_global = hardest_out
+            hardest_evm_global = hardest_evm
 
         if master:
             dt = time.time() - t0
-            print(
+            msg = (
                 f"Epoch {epoch:03d} | val {val_loss:.6f} | "
-                f"SNR_in {snr_in:+.2f} dB → SNR_out {snr_out:+.2f} dB | "
-                f"EVM {evm:.2f}% | {dt:.1f}s"
+                f"SNR_in {snr_in:+.2f} dB → SNR_out {snr_out:+.2f} dB "
+                f"(Δ {snr_gain:+.2f} dB) | "
+                f"EVM {evm:.2f}% | "
+                f"hardest sample: SNR_in {hardest_in_global:+.2f} dB → "
+                f"SNR_out {hardest_out_global:+.2f} dB | "
+                f"EVM {hardest_evm_global:.2f}% | "
+                f"{dt:.1f}s"
             )
+            print(msg)
 
         # save best
         if master and (val_loss < best_val):
@@ -611,7 +675,8 @@ def train(args):
             Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
             out_path = Path(args.ckpt_dir) / "best.pt"
             torch.save(ck, out_path)
-            print("  ↳ saved best ->", out_path)
+            if master:
+                print("  ↳ saved best ->", out_path)
 
     if world > 1:
         dist.destroy_process_group()
